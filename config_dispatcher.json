@@ -1,0 +1,14 @@
+{
+  "root_sp": "C:/Users/nmasl/Desktop/TestSharePoint",
+  "prod_ia": "C:/Users/nmasl/Desktop/TestADeposer",
+  "supprimer": true,
+  "supp_adeposer": true,
+  "mode": "ids",
+  "ppt_remplacer": false,
+  "ppt_modifier": true,
+  "colonnes_maj": [
+    "Date Analyse",
+    "Analyse nombre de Logement",
+    "Remarque"
+  ]
+}
