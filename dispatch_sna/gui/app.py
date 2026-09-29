@@ -1,359 +1,21 @@
+"""Fenêtre principale du Dispatcher SNA (Tkinter).
+
+Le travail est fait par dispatch_sna.services dans un thread ; la fenêtre ne
+lit que la file de logs et l'état partagé (self._logq / self._state) via _poll.
 """
-═══════════════════════════════════════════════════════════════════
-  DISPATCHER SNA — Organisation (PC SFR / OneDrive)
-═══════════════════════════════════════════════════════════════════
-Lit le dossier "Prod IA" (déposé depuis le PC Babayaga : un sous-dossier
-par commune contenant l'Excel rempli + les PPT), puis range chaque fichier
-au bon endroit dans l'arborescence SharePoint :
-
-  Prod IA/81016/audit_81016.xlsx        →  Dep81/81016/audit_81016.xlsx  (remplace)
-  Prod IA/81016/cas_analyse_81016_*.pptx →  Dep81/81016/analyse/
-
-Une fois une commune rangée, son dossier dans Prod IA est SUPPRIMÉ.
-
-Mode « ID erreur » : l'utilisateur colle des ID erreur (74143_1, 38068_207...).
-Seules les lignes de ces ID sont remplacées dans Dep/commune/audit_commune.xlsx
-(le reste du fichier SharePoint est conservé), et pour les PPT au choix :
-  - Remplacer les PPT : cas_analyse_<ID>.pptx écrasé par celui de Prod IA
-  - Modifier les PPT  : zones « Analyse » et « Lien Street View » du PPT
-                        existant réécrites avec les colonnes « Remarque » et
-                        « Lien Street View » de la ligne de l'ID
-
-Sécurités :
-- Ne touche rien si le dossier destination DepXX/commune n'existe pas.
-- Remplace proprement le fichier Excel vierge du client.
-- Ne supprime de Prod IA que si tout a réussi.
-
-Lancement : double-clic (renommer en .pyw pour masquer la console)
-═══════════════════════════════════════════════════════════════════
-"""
+import os
+import threading
+import time as _time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-import threading, os, json, shutil, re, warnings, time as _time
-from dispatch_ids import (extraire_ids, maj_lignes_excel, lire_lignes, lire_entetes, modifier_ppt,
-                          copier_ppt, nom_ppt, COL_ID_ERR, COL_REMARQUE, COL_LIEN_SV)
 
-warnings.filterwarnings('ignore')
-
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config_dispatcher.json")
-
-DEFAULT_CFG = {
-    "root_sp":  r"C:\Users\u269775\Altice Campus SFR\Swap Adresse - Etude Cible\audit_SNA",
-    "prod_ia":  r"C:\Users\u269775\Altice Campus SFR\Swap Adresse - Etude Cible\audit_SNA\Prod IA\À déposer",
-    "supprimer": True,   # supprimer le dossier commune de Prod IA après rangement
-    "supp_adeposer": True,  # supprimer le dossier "À déposer" entier à la fin
-    "mode": "commune",      # "commune" (tout ranger) ou "ids" (lignes des ID erreur)
-    "ppt_remplacer": False, # mode ids : remplacer les PPT par ceux de Prod IA
-    "ppt_modifier": True,   # mode ids : modifier Analyse + Lien Street View
-    "colonnes_maj": None,   # mode ids : colonnes Excel à mettre à jour (None = toutes)
-}
-
-DEP_PREFIX   = "Dep"
-AUDIT_PREFIX = "audit_"
-PPT_FOLDER   = "analyse"
-PPT_PREFIX   = "cas_analyse_"
-
-
-# ── Config ────────────────────────────────────────────────────────
-def load_config():
-    if os.path.isfile(CONFIG_FILE):
-        try:
-            d = json.load(open(CONFIG_FILE, encoding="utf-8"))
-            for k, v in DEFAULT_CFG.items(): d.setdefault(k, v)
-            return d
-        except: pass
-    return dict(DEFAULT_CFG)
-
-def save_config(d):
-    try: json.dump(d, open(CONFIG_FILE, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
-    except: pass
-
-
-# ── Helpers ───────────────────────────────────────────────────────
-def extraire_commune_nom(nom):
-    """Code commune (5 chiffres ou 2A/2B+3) depuis un nom de dossier/fichier."""
-    m = re.search(r'(2[ABab]\d{3}|\d{5})', nom)
-    return m.group(1).upper() if m else None
-
-def get_dep(commune):
-    return f"{DEP_PREFIX}{str(commune).strip().upper()[:2]}"
-
-def onedrive_pin(path):
-    """Force OneDrive à garder le fichier en local (libère l'espace après)."""
-    try: os.system(f'attrib +U -P "{path}"')
-    except: pass
-
-def detecter_colonnes(prod_ia, root_sp, essais=3):
-    """En-têtes de l'onglet Audit : 1er Excel lisible dans Prod IA, sinon un
-    audit_<commune>.xlsx de SharePoint. Retourne (colonnes, fichier) ou ([], None)."""
-    candidats = []
-    if os.path.isdir(prod_ia):
-        for d in sorted(os.listdir(prod_ia)):
-            full = os.path.join(prod_ia, d)
-            if os.path.isdir(full) and extraire_commune_nom(d):
-                candidats += [os.path.join(full, f) for f in sorted(os.listdir(full))
-                              if f.lower().endswith(".xlsx") and not f.startswith("~")]
-    if not candidats and os.path.isdir(root_sp):
-        for dep in sorted(os.listdir(root_sp)):
-            dep_dir = os.path.join(root_sp, dep)
-            if not (dep.startswith(DEP_PREFIX) and os.path.isdir(dep_dir)): continue
-            for com in sorted(os.listdir(dep_dir)):
-                f = os.path.join(dep_dir, com, f"{AUDIT_PREFIX}{com}.xlsx")
-                if os.path.isfile(f): candidats.append(f)
-                if len(candidats) >= essais: break
-            if len(candidats) >= essais: break
-    for f in candidats[:essais]:
-        try:
-            cols = lire_entetes(f)
-            if cols: return cols, f
-        except Exception:
-            continue
-    return [], None
-
-def copier_remplacer(src, dst, log_fn):
-    """Copie src → dst en remplaçant proprement. Retourne True si OK."""
-    try:
-        # Écriture via un fichier temporaire pour éviter la corruption
-        tmp = dst + ".tmp"
-        shutil.copy2(src, tmp)
-        if os.path.isfile(dst):
-            os.remove(dst)
-        shutil.move(tmp, dst)
-        onedrive_pin(dst)
-        return True
-    except PermissionError:
-        log_fn(f"    ⚠️ {os.path.basename(dst)} verrouillé (ouvert dans Excel ?)", "#ffb74d")
-        return False
-    except Exception as e:
-        log_fn(f"    ❌ Erreur copie {os.path.basename(dst)} : {e}", "#ef5350")
-        return False
-
-
-# ── Traitement d'une commune ──────────────────────────────────────
-def ranger_commune(prod_ia, root_sp, commune, dossier_src, supprimer, log_fn, phase_fn=None):
-    """Range les fichiers d'une commune depuis Prod IA vers Dep/commune.
-    Retourne un dict stats ou None si erreur bloquante."""
-    def phase(n, e="run"):
-        if phase_fn: phase_fn(n, e)
-
-    dep = get_dep(commune)
-    dossier_dst = os.path.join(root_sp, dep, commune)
-    ppt_dst = os.path.join(dossier_dst, PPT_FOLDER)
-
-    phase("verif", "run")
-    # 1. Vérifier que la destination existe
-    if not os.path.isdir(dossier_dst):
-        log_fn(f"  ❌ Destination introuvable : {dep}/{commune}", "#ef5350")
-        log_fn(f"     → dossier laissé dans Prod IA (non supprimé)", "#ffb74d")
-        phase("verif", "err")
-        return None
-    phase("verif", "ok")
-
-    # 2. Lister les fichiers source
-    phase("analyse", "run")
-    fichiers = os.listdir(dossier_src)
-    excels = [f for f in fichiers if f.lower().endswith(".xlsx") and not f.startswith("~")]
-    ppts   = [f for f in fichiers if f.lower().endswith(".pptx")]
-    log_fn(f"  📁 {len(excels)} Excel · {len(ppts)} PPT à ranger", "#78909c")
-    phase("analyse", "ok")
-
-    stats = {"excel": 0, "ppt": 0, "err": 0}
-
-    # 3. Ranger l'Excel (remplace le vierge du client)
-    phase("excel", "run")
-    for f in excels:
-        src = os.path.join(dossier_src, f)
-        dst = os.path.join(dossier_dst, f"{AUDIT_PREFIX}{commune}.xlsx")
-        if copier_remplacer(src, dst, log_fn):
-            stats["excel"] += 1
-            log_fn(f"  📊 Excel → {dep}/{commune}/ (remplacé)", "#69f0ae")
-        else:
-            stats["err"] += 1
-    phase("excel", "ok" if stats["err"] == 0 else "err")
-
-    # 4. Ranger les PPT dans analyse/
-    phase("ppt", "run")
-    os.makedirs(ppt_dst, exist_ok=True)
-    for f in ppts:
-        src = os.path.join(dossier_src, f)
-        dst = os.path.join(ppt_dst, f)
-        if copier_remplacer(src, dst, log_fn):
-            stats["ppt"] += 1
-        else:
-            stats["err"] += 1
-    log_fn(f"  🖼️  {stats['ppt']} PPT → {dep}/{commune}/{PPT_FOLDER}/", "#69f0ae")
-    phase("ppt", "ok" if stats["err"] == 0 else "err")
-
-    # 5. Supprimer le dossier commune de Prod IA (si tout a réussi)
-    phase("nettoyage", "run")
-    if stats["err"] == 0:
-        if supprimer:
-            try:
-                shutil.rmtree(dossier_src)
-                log_fn(f"  🗑️  Dossier Prod IA/{commune} supprimé", "#ffb74d")
-            except Exception as e:
-                log_fn(f"  ⚠️ Impossible de supprimer Prod IA/{commune} : {e}", "#ffb74d")
-        else:
-            log_fn(f"  ⏭️ Suppression désactivée (dossier gardé)", "#78909c")
-        phase("nettoyage", "ok")
-    else:
-        log_fn(f"  ⚠️ {stats['err']} erreur(s) → dossier Prod IA/{commune} conservé", "#ffb74d")
-        phase("nettoyage", "err")
-
-    return stats
-
-
-# ── Traitement ciblé par ID erreur ────────────────────────────────
-def ranger_ids(root_sp, commune, dossier_src, ids, ppt_mode, supprimer, log_fn, phase_fn=None,
-               colonnes=None):
-    """Met à jour Dep/commune uniquement pour les ID erreur donnés.
-    ppt_mode : "remplacer", "modifier" ou None (Excel seul).
-    colonnes : colonnes Excel à mettre à jour (None = toutes, [] = aucune).
-    Retourne un dict stats ou None si erreur bloquante."""
-    def phase(n, e="run"):
-        if phase_fn: phase_fn(n, e)
-
-    dep = get_dep(commune)
-    dossier_dst = os.path.join(root_sp, dep, commune)
-    ppt_dst = os.path.join(dossier_dst, PPT_FOLDER)
-    excel_dst = os.path.join(dossier_dst, f"{AUDIT_PREFIX}{commune}.xlsx")
-    stats = {"lignes": 0, "excel": 0, "ppt": 0, "err": 0}
-
-    # 1. Vérifications
-    phase("verif", "run")
-    if not dossier_src or not os.path.isdir(dossier_src):
-        log_fn(f"  ❌ Aucun dossier {commune} dans Prod IA", "#ef5350")
-        phase("verif", "err"); return None
-    if not os.path.isdir(dossier_dst):
-        log_fn(f"  ❌ Destination introuvable : {dep}/{commune}", "#ef5350")
-        phase("verif", "err"); return None
-    if not os.path.isfile(excel_dst):
-        log_fn(f"  ❌ Excel SharePoint introuvable : {dep}/{commune}/{os.path.basename(excel_dst)}", "#ef5350")
-        phase("verif", "err"); return None
-    phase("verif", "ok")
-
-    # 2. Excel source
-    phase("analyse", "run")
-    excels = [f for f in os.listdir(dossier_src) if f.lower().endswith(".xlsx") and not f.startswith("~")]
-    nom_src = f"{AUDIT_PREFIX}{commune}.xlsx"
-    nom_src = nom_src if nom_src in excels else (excels[0] if excels else None)
-    if not nom_src:
-        log_fn(f"  ❌ Aucun Excel dans Prod IA/{commune}", "#ef5350")
-        phase("analyse", "err"); return None
-    excel_src = os.path.join(dossier_src, nom_src)
-    log_fn(f"  🔎 {len(ids)} ID erreur · source {nom_src}", "#78909c")
-    phase("analyse", "ok")
-
-    # 3. Excel : remplacement des seules lignes des ID
-    phase("excel", "run")
-    donnees, ids_src = None, []
-    try:
-        r = maj_lignes_excel(excel_src, excel_dst, ids, colonnes)
-        donnees, ids_src = r["donnees"], r["ids_src"]
-        stats["lignes"] = len(r["maj"]); stats["excel"] = 1 if r["maj"] else 0
-        if colonnes is not None and not colonnes:
-            log_fn("  ⏭️ Excel non modifié (aucune colonne cochée)", "#78909c")
-        if r["maj"]:
-            quoi = "toutes colonnes" if colonnes is None else f"{len(colonnes)} colonne(s)"
-            log_fn(f"  📊 {len(r['maj'])} ligne(s) mise(s) à jour ({quoi}) dans {dep}/{commune}/{os.path.basename(excel_dst)}", "#69f0ae")
-        if r["col_absentes"]:
-            log_fn(f"    ⚠️ Colonne(s) cochée(s) absente(s) d'un des deux Excel, ignorée(s) : {', '.join(r['col_absentes'])}", "#ffb74d")
-        if r["absents_src"]:
-            stats["err"] += len(r["absents_src"])
-            log_fn(f"    ⚠️ Absent(s) de l'Excel Prod IA : {', '.join(r['absents_src'])}", "#ffb74d")
-        if r["absents_dst"]:
-            stats["err"] += len(r["absents_dst"])
-            log_fn(f"    ⚠️ Absent(s) de l'Excel SharePoint (non ajoutés) : {', '.join(r['absents_dst'])}", "#ffb74d")
-    except PermissionError:
-        stats["err"] += 1
-        log_fn(f"    ⚠️ {os.path.basename(excel_dst)} verrouillé (ouvert dans Excel ?)", "#ffb74d")
-    except Exception as e:
-        stats["err"] += 1
-        log_fn(f"    ❌ Erreur Excel : {e}", "#ef5350")
-    phase("excel", "ok" if stats["err"] == 0 else "err")
-
-    # 4. PPT
-    phase("ppt", "run")
-    err_avant = stats["err"]
-    if ppt_mode is None:
-        log_fn("  ⏭️ PPT non traités (aucune option PPT cochée)", "#78909c")
-    else:
-        os.makedirs(ppt_dst, exist_ok=True)
-        if ppt_mode == "modifier" and donnees is None:
-            try: donnees = lire_lignes(excel_src, ids)
-            except Exception as e:
-                donnees = {}; log_fn(f"    ❌ Lecture Excel Prod IA impossible : {e}", "#ef5350")
-        for id_err in ids:
-            nom = nom_ppt(id_err)
-            src, dst = os.path.join(dossier_src, nom), os.path.join(ppt_dst, nom)
-            try:
-                if ppt_mode == "remplacer" or not os.path.isfile(dst):
-                    if not os.path.isfile(src):
-                        stats["err"] += 1
-                        log_fn(f"    ⚠️ {nom} absent de Prod IA/{commune}", "#ffb74d"); continue
-                    if ppt_mode == "modifier":
-                        log_fn(f"    ℹ️ {nom} absent de SharePoint → copie du nouveau PPT", "#78909c")
-                    copier_ppt(src, dst); onedrive_pin(dst); stats["ppt"] += 1
-                    continue
-                d = donnees.get(id_err.upper())
-                if d is None:
-                    stats["err"] += 1
-                    log_fn(f"    ⚠️ {id_err} absent de l'Excel Prod IA → {nom} non modifié", "#ffb74d"); continue
-                analyse, lien = d[COL_REMARQUE] or None, d[COL_LIEN_SV] or None
-                if analyse is None and lien is None:
-                    log_fn(f"    ⚠️ {id_err} : « {COL_REMARQUE} » et « {COL_LIEN_SV} » vides → {nom} non modifié", "#ffb74d")
-                    continue
-                res = modifier_ppt(dst, analyse, lien)
-                manque = [z for z, v, ok in (("Analyse", analyse, res["analyse"]),
-                                             ("Lien Street View", lien, res["lien"])) if v and not ok]
-                vides = [c for c, v in ((COL_REMARQUE, analyse), (COL_LIEN_SV, lien)) if not v]
-                if manque:
-                    stats["err"] += 1
-                    log_fn(f"    ⚠️ {nom} : zone(s) introuvable(s) : {', '.join(manque)}", "#ffb74d")
-                if vides:
-                    log_fn(f"    ℹ️ {id_err} : « {', '.join(vides)} » vide → zone laissée telle quelle", "#78909c")
-                if res["analyse"] or res["lien"]:
-                    onedrive_pin(dst); stats["ppt"] += 1
-            except PermissionError:
-                stats["err"] += 1
-                log_fn(f"    ⚠️ {nom} verrouillé (ouvert dans PowerPoint ?)", "#ffb74d")
-            except Exception as e:
-                stats["err"] += 1
-                log_fn(f"    ❌ {nom} : {e}", "#ef5350")
-        verbe = "remplacé(s)" if ppt_mode == "remplacer" else "modifié(s)"
-        log_fn(f"  🖼️  {stats['ppt']} PPT {verbe} → {dep}/{commune}/{PPT_FOLDER}/", "#69f0ae")
-    phase("ppt", "ok" if stats["err"] == err_avant else "err")
-
-    # 5. Nettoyage : seulement si tout a réussi ET que le dossier ne contient
-    #    pas d'autres ID que ceux saisis (sinon on les perdrait)
-    phase("nettoyage", "run")
-    autres = [i for i in ids_src if i not in set(ids)]
-    if stats["err"]:
-        log_fn(f"  ⚠️ {stats['err']} erreur(s) → dossier Prod IA/{commune} conservé", "#ffb74d")
-        phase("nettoyage", "err")
-    elif not supprimer:
-        log_fn(f"  ⏭️ Suppression désactivée (dossier gardé)", "#78909c"); phase("nettoyage", "ok")
-    elif autres:
-        log_fn(f"  ⏭️ Prod IA/{commune} conservé : {len(autres)} autre(s) ID non traité(s)", "#78909c")
-        phase("nettoyage", "ok")
-    else:
-        try:
-            shutil.rmtree(dossier_src)
-            log_fn(f"  🗑️  Dossier Prod IA/{commune} supprimé", "#ffb74d")
-        except Exception as e:
-            log_fn(f"  ⚠️ Impossible de supprimer Prod IA/{commune} : {e}", "#ffb74d")
-        phase("nettoyage", "ok")
-    return stats
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  INTERFACE
-# ═══════════════════════════════════════════════════════════════════
-C_BG="#080b12"; C_PANEL="#11161f"; C_PANEL2="#161d2a"; C_CARD="#131925"
-C_BORDER="#1f2735"; C_BORDER2="#2a3447"; C_TEXT="#eef1f6"; C_TEXT2="#c5cdda"
-C_MUTED="#6b7689"; C_ACCENT="#6ba3ff"; C_GREEN="#42e2a0"; C_AMBER="#ffc05a"
-C_RED="#ff6b7a"; C_PURPLE="#bf94f5"; C_CYAN="#5be8d4"
-F_TITLE="Segoe UI Semibold"; F_BODY="Segoe UI"; F_MONO="Consolas"
+from ..config import load_config, save_config
+from ..services.chemins import get_dep, lister_communes_prod, detecter_colonnes, supprimer_si_vide
+from ..services.constantes import COL_ID_ERR
+from ..services.dispatcher import ranger_commune, ranger_ids
+from ..services.error_ids import extraire_ids
+from .theme import (C_ACCENT, C_AMBER, C_BG, C_BORDER, C_BORDER2, C_CARD, C_CYAN, C_GREEN, C_MUTED,
+                    C_PANEL, C_PANEL2, C_PURPLE, C_RED, C_TEXT, C_TEXT2, F_BODY, F_MONO, F_TITLE)
 
 PHASES = [("verif","Vérif dest."),("analyse","Analyse"),("excel","Excel"),
           ("ppt","PPT"),("nettoyage","Nettoyage")]
@@ -452,20 +114,6 @@ class App(tk.Tk):
         self.var_supp = tk.BooleanVar(value=bool(self.cfg.get("supprimer", True)))
         self._check(opt, "🗑️ Supprimer le dossier de Prod IA après rangement", self.var_supp, self._save_cfg)
 
-        # Colonnes Excel à mettre à jour (mode ID erreur)
-        colh = tk.Frame(cfg, bg=C_CARD); colh.pack(fill="x", pady=(16,0))
-        tk.Label(colh, text="Colonnes Excel à mettre à jour (mode ID erreur)", bg=C_CARD, fg=C_TEXT2,
-                 font=(F_BODY,9,"bold")).pack(side="left")
-        for txt, cmd in [("🔍 Détecter", self._detect_cols), ("☑ Toutes", lambda: self._cocher_cols(True)),
-                         ("☐ Aucune", lambda: self._cocher_cols(False))]:
-            tk.Button(colh, text=txt, command=cmd, bg=C_PANEL2, fg=C_TEXT2, font=(F_BODY,8), relief="flat",
-                      cursor="hand2", padx=10, pady=2).pack(side="right", padx=(6,0))
-        self.lbl_cols = tk.Label(cfg, text="", bg=C_CARD, fg=C_MUTED, font=(F_BODY,8), justify="left",
-                                 wraplength=900)
-        self.lbl_cols.pack(anchor="w")
-        self.frm_cols = tk.Frame(cfg, bg=C_CARD); self.frm_cols.pack(fill="x", pady=(4,0))
-        self._col_vars = {}
-
         # STATUT
         st_wrap = tk.Frame(root, bg=C_BORDER); st_wrap.pack(fill="x", padx=20, pady=(0,14))
         self.frm_status = tk.Frame(st_wrap, bg="#0a0f1a"); self.frm_status.pack(fill="both", padx=1, pady=1)
@@ -511,7 +159,22 @@ class App(tk.Tk):
         self.lbl_ids_ph.place(x=9, y=7)
         self.lbl_ids = tk.Label(self.frm_ids, text="", bg=C_CARD, fg=C_MUTED, font=(F_BODY,8))
         self.lbl_ids.pack(anchor="w")
-        prow = tk.Frame(self.frm_ids, bg=C_CARD); prow.pack(fill="x", pady=(6,0))
+
+        # Colonnes Excel à mettre à jour
+        colh = tk.Frame(self.frm_ids, bg=C_CARD); colh.pack(fill="x", pady=(10,0))
+        tk.Label(colh, text="Colonnes Excel à mettre à jour :", bg=C_CARD, fg=C_MUTED,
+                 font=(F_BODY,9,"bold")).pack(side="left")
+        for txt, cmd in [("🔍 Détecter", self._detect_cols), ("☑ Toutes", lambda: self._cocher_cols(True)),
+                         ("☐ Aucune", lambda: self._cocher_cols(False))]:
+            tk.Button(colh, text=txt, command=cmd, bg=C_PANEL2, fg=C_TEXT2, font=(F_BODY,8), relief="flat",
+                      cursor="hand2", padx=10, pady=2).pack(side="right", padx=(6,0))
+        self.frm_cols = tk.Frame(self.frm_ids, bg=C_CARD); self.frm_cols.pack(fill="x", pady=(4,0))
+        self.lbl_cols = tk.Label(self.frm_ids, text="", bg=C_CARD, fg=C_MUTED, font=(F_BODY,8), justify="left",
+                                 wraplength=900)
+        self.lbl_cols.pack(anchor="w")
+        self._col_vars = {}
+
+        prow = tk.Frame(self.frm_ids, bg=C_CARD); prow.pack(fill="x", pady=(10,0))
         tk.Label(prow, text="PPT :", bg=C_CARD, fg=C_MUTED, font=(F_BODY,9,"bold")).pack(side="left", padx=(0,4))
         self.var_ppt_rempl = tk.BooleanVar(value=bool(self.cfg.get("ppt_remplacer", False)))
         self.var_ppt_modif = tk.BooleanVar(value=bool(self.cfg.get("ppt_modifier", True))
@@ -790,15 +453,7 @@ class App(tk.Tk):
     # ── Aperçu ──
     def _scan(self):
         """Liste les dossiers commune dans Prod IA."""
-        prod = self.ent_prod_ia.get().strip()
-        res = {}
-        if not os.path.isdir(prod): return res
-        for d in os.listdir(prod):
-            full = os.path.join(prod, d)
-            if os.path.isdir(full):
-                com = extraire_commune_nom(d)
-                if com: res[com] = full
-        return res
+        return lister_communes_prod(self.ent_prod_ia.get().strip())
 
     def _preview(self):
         if self._running: return
@@ -991,18 +646,7 @@ class App(tk.Tk):
     def _supprimer_adeposer(self, prod_ia):
         """Supprime le dossier "À déposer" entier s'il est vide (tout rangé)."""
         if not (bool(self.var_supp.get()) and self.cfg.get("supp_adeposer", True)): return
-        try:
-            restant = [d for d in os.listdir(prod_ia)
-                       if os.path.isdir(os.path.join(prod_ia, d))]
-            if not restant:
-                # dossier vide → on le supprime entièrement
-                base = os.path.basename(prod_ia.rstrip("\\/"))
-                shutil.rmtree(prod_ia)
-                self._log(f"\n🗑️  Dossier '{base}' supprimé (vide) — prêt pour un nouveau dépôt", C_AMBER)
-            else:
-                self._log(f"\n⚠️ '{os.path.basename(prod_ia)}' conservé ({len(restant)} commune(s) non rangée(s) : {', '.join(restant)})", C_AMBER)
-        except Exception as e:
-            self._log(f"\n⚠️ Impossible de supprimer le dossier : {e}", C_AMBER)
+        supprimer_si_vide(prod_ia, self._log)
 
     def _finish(self, tot):
         el=tot.get("_el",0); self._t_start=None
@@ -1020,7 +664,3 @@ class App(tk.Tk):
                      f"Excel remplacés : {tot['excel']}\nPPT déposés : {tot['ppt']}\n")
         messagebox.showinfo("Terminé", corps + f"Erreurs : {tot['err']}\n\n"
                             "OneDrive synchronise vers SharePoint.")
-
-
-if __name__ == "__main__":
-    App().mainloop()

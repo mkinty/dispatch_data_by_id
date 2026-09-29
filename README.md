@@ -34,10 +34,33 @@ rempli + `cas_analyse_<ID>.pptx`) dans l'arborescence SharePoint
   - Le dossier Prod IA de la commune n'est supprimé que si tout a réussi **et**
     qu'il ne contient pas d'autres ID que ceux saisis.
 
+## Structure
+
+```
+main.py                      # Point d'entrée : lance la fenêtre
+dispatch_sna/
+├── config.py                # Chargement/sauvegarde config_dispatcher.json
+├── services/                # Logique métier PURE — aucune dépendance à Tkinter
+│   ├── constantes.py        #   préfixes Dep/audit_/cas_analyse_, noms de colonnes
+│   ├── error_ids.py         #   extraction des ID erreur, regroupés par commune
+│   ├── excel_rows.py        #   en-têtes, lecture et remplacement des lignes (openpyxl)
+│   ├── ppt_editor.py        #   réécriture Analyse / Lien Street View (XML du .pptx)
+│   ├── chemins.py           #   arborescence Prod IA / SharePoint, copies, détection des colonnes
+│   └── dispatcher.py        #   orchestration : ranger_commune / ranger_ids
+└── gui/                     # Présentation uniquement — délègue aux services
+    ├── theme.py             #   couleurs et polices
+    └── app.py               #   fenêtre Tkinter (thread de travail + _poll)
+tests/                       # un fichier de test par service (+ fichiers.py : fabriques de fichiers)
+```
+
+**Règle** : `services/` n'importe jamais `gui/`. Les services rendent compte de
+leur progression via deux callbacks (`log_fn(message, couleur)` et
+`phase_fn(étape, état)`), ce qui permet de tout tester sans ouvrir de fenêtre.
+
 ## Lancer
 
 ```bash
-uv run dispatch_data.py
+uv run main.py
 ```
 
 ## Tests

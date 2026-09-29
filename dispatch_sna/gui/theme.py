@@ -1,0 +1,6 @@
+"""Palette et polices de l'interface."""
+C_BG="#080b12"; C_PANEL="#11161f"; C_PANEL2="#161d2a"; C_CARD="#131925"
+C_BORDER="#1f2735"; C_BORDER2="#2a3447"; C_TEXT="#eef1f6"; C_TEXT2="#c5cdda"
+C_MUTED="#6b7689"; C_ACCENT="#6ba3ff"; C_GREEN="#42e2a0"; C_AMBER="#ffc05a"
+C_RED="#ff6b7a"; C_PURPLE="#bf94f5"; C_CYAN="#5be8d4"
+F_TITLE="Segoe UI Semibold"; F_BODY="Segoe UI"; F_MONO="Consolas"
