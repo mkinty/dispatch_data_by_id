@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 from copy import copy
+from dataclasses import dataclass
 
 from openpyxl import load_workbook
 from openpyxl.formula.translate import Translator
@@ -46,13 +47,17 @@ def _valeur_cellule(cell) -> str:
     return "" if cell.value is None else str(cell.value).strip()
 
 
-def _copier_cellule(src, dst):
-    v = src.value
-    if isinstance(v, str) and v.startswith("=") and src.coordinate != dst.coordinate:
-        # Recale les références relatives sur la ligne de destination
-        try: v = Translator(v, origin=src.coordinate).translate_formula(dst.coordinate)
+def formule_pour(valeur, origine: str, cible: str):
+    """Recale les références relatives d'une formule copiée de `origine` vers `cible` (ex. J57 → J3).
+    Toute autre valeur est rendue telle quelle."""
+    if isinstance(valeur, str) and valeur.startswith("=") and origine != cible:
+        try: return Translator(valeur, origin=origine).translate_formula(cible)
         except Exception: pass
-    dst.value = v
+    return valeur
+
+
+def _copier_cellule(src, dst):
+    dst.value = formule_pour(src.value, src.coordinate, dst.coordinate)
     dst.hyperlink = copy(src.hyperlink) if src.hyperlink else None
     if src.has_style:
         dst.font = copy(src.font); dst.fill = copy(src.fill); dst.border = copy(src.border)
@@ -91,6 +96,46 @@ def lire_lignes(chemin: str, ids) -> dict[str, dict[str, str]]:
 
 class ExcelErreur(Exception):
     """Structure inattendue (colonne ID erreur absente...)."""
+
+
+@dataclass
+class Cellule:
+    """Contenu d'une cellule source à reporter : valeur (ou formule), lien, format, position."""
+    valeur: object
+    lien: str | None
+    format: str
+    coord: str
+
+
+def lire_cellules(src: str, ids, colonnes=None) -> dict:
+    """Lit dans l'Excel Prod IA les cellules à reporter, pour une écriture cellule par cellule.
+
+    `colonnes` : None = toutes, [] = aucune (même convention que maj_lignes_excel).
+    Retourne {"entetes": [...], "cellules": {ID → {colonne → Cellule}},
+              "donnees": {ID → {Remarque, Lien Street View}}, "ids_src": [...], "absents_src": [...]}.
+    """
+    wanted = list(dict.fromkeys(_norm(i) for i in ids))
+    wb = load_workbook(src); ws = trouver_onglet(wb)
+    h = _entetes(ws)
+    if COL_ID_ERR not in h:
+        raise ExcelErreur(f"colonne « {COL_ID_ERR} » absente de l'Excel Prod IA")
+    idx = _index_ids(ws, h[COL_ID_ERR])
+    voulues = None if colonnes is None else {str(c).strip() for c in colonnes} - {COL_ID_ERR}
+    noms = [n for n in h if n != COL_ID_ERR and (voulues is None or n in voulues)]
+    res = {"entetes": list(h), "cellules": {}, "donnees": {}, "ids_src": list(idx), "absents_src": []}
+    for i in wanted:
+        r = idx.get(i)
+        if r is None:
+            res["absents_src"].append(i); continue
+        res["donnees"][i] = {col: (_valeur_cellule(ws.cell(r, h[col])) if col in h else "")
+                             for col in (COL_REMARQUE, COL_LIEN_SV)}
+        cells = {}
+        for n in noms:
+            c = ws.cell(r, h[n])
+            lien = getattr(c.hyperlink, "target", None) if c.hyperlink else None
+            cells[n] = Cellule(c.value, lien, c.number_format or "General", c.coordinate)
+        res["cellules"][i] = cells
+    return res
 
 
 def maj_lignes_excel(src: str, dst: str, ids, colonnes=None) -> dict:

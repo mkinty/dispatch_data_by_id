@@ -7,7 +7,7 @@ from tests.fichiers import arbo, excel, log, textes
 def test_ranger_ids_modifier(tmp_path):
     root, src_dir, dst_dir = arbo(tmp_path)
     st = ranger_ids(str(root), "74143", str(src_dir), ["74143_1"], "modifier", True, log)
-    assert st == {"lignes": 1, "excel": 1, "ppt": 1, "err": 0}
+    assert st == {"lignes": 1, "excel": 1, "ppt": 1, "err": 0, "echecs": {}}
     t = textes(dst_dir / "analyse" / "cas_analyse_74143_1.pptx")
     assert "Rem 1" in t and "Lien Street View : https://sv/1" in t
     assert "SNA nombre de logement: 2" in t        # c'est bien l'ancien PPT modifié
@@ -30,14 +30,14 @@ def test_ranger_ids_sans_option_ppt(tmp_path):
     root, src_dir, dst_dir = arbo(tmp_path)
     avant = open(dst_dir / "analyse" / "cas_analyse_74143_1.pptx", "rb").read()
     st = ranger_ids(str(root), "74143", str(src_dir), ["74143_1"], None, False, log)
-    assert st == {"lignes": 1, "excel": 1, "ppt": 0, "err": 0}
+    assert st == {"lignes": 1, "excel": 1, "ppt": 0, "err": 0, "echecs": {}}
     assert open(dst_dir / "analyse" / "cas_analyse_74143_1.pptx", "rb").read() == avant
 
 
 def test_ranger_ids_aucune_colonne_mais_ppt_modifie(tmp_path):
     root, src_dir, dst_dir = arbo(tmp_path)
     st = ranger_ids(str(root), "74143", str(src_dir), ["74143_1"], "modifier", True, log, colonnes=[])
-    assert st == {"lignes": 0, "excel": 0, "ppt": 1, "err": 0}
+    assert st == {"lignes": 0, "excel": 0, "ppt": 1, "err": 0, "echecs": {}}
     assert load_workbook(dst_dir / "audit_74143.xlsx").active["C2"].value == "vierge"
     assert "Rem 1" in textes(dst_dir / "analyse" / "cas_analyse_74143_1.pptx")
 

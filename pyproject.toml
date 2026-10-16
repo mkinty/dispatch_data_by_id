@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "openpyxl>=3.1",
+    "pywin32>=306 ; sys_platform == 'win32'",
 ]
 
 [dependency-groups]
@@ -16,3 +17,5 @@ dev = [
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+# faulthandler signale à tort l'exception COM RPC_E_DISCONNECTED (gérée par Windows) à la fermeture d'Excel
+addopts = "-p no:faulthandler"

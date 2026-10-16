@@ -87,19 +87,26 @@ def ranger_commune(prod_ia, root_sp, commune, dossier_src, supprimer, log_fn, ph
 
 # ── Traitement ciblé par ID erreur ────────────────────────────────
 def ranger_ids(root_sp, commune, dossier_src, ids, ppt_mode, supprimer, log_fn, phase_fn=None,
-               colonnes=None):
+               colonnes=None, maj_excel=None):
     """Met à jour Dep/commune uniquement pour les ID erreur donnés.
     ppt_mode : "remplacer", "modifier" ou None (Excel seul).
     colonnes : colonnes Excel à mettre à jour (None = toutes, [] = aucune).
-    Retourne un dict stats ou None si erreur bloquante."""
+    maj_excel : fonction (src, dst, ids, colonnes) → résultat ; par défaut réécriture du
+                fichier (maj_lignes_excel), ou SessionExcel.maj_lignes pour la co-édition.
+    Retourne un dict stats (dont "echecs" : {ID → raison}) ou None si erreur bloquante."""
     def phase(n, e="run"):
         if phase_fn: phase_fn(n, e)
 
+    def echec(liste, raison):
+        for i in liste:
+            stats["echecs"][i] = f"{stats['echecs'][i]} ; {raison}" if i in stats["echecs"] else raison
+
+    maj_excel = maj_excel or maj_lignes_excel
     dep = get_dep(commune)
     dossier_dst = os.path.join(root_sp, dep, commune)
     ppt_dst = os.path.join(dossier_dst, PPT_FOLDER)
     excel_dst = os.path.join(dossier_dst, f"{AUDIT_PREFIX}{commune}.xlsx")
-    stats = {"lignes": 0, "excel": 0, "ppt": 0, "err": 0}
+    stats = {"lignes": 0, "excel": 0, "ppt": 0, "err": 0, "echecs": {}}
 
     # 1. Vérifications
     phase("verif", "run")
@@ -129,28 +136,47 @@ def ranger_ids(root_sp, commune, dossier_src, ids, ppt_mode, supprimer, log_fn, 
     # 3. Excel : remplacement des seules lignes des ID
     phase("excel", "run")
     donnees, ids_src = None, []
+    excel_voulu = colonnes is None or bool(colonnes)
+    nom_dst = os.path.basename(excel_dst)
     try:
-        r = maj_lignes_excel(excel_src, excel_dst, ids, colonnes)
+        r = maj_excel(excel_src, excel_dst, ids, colonnes)
         donnees, ids_src = r["donnees"], r["ids_src"]
         stats["lignes"] = len(r["maj"]); stats["excel"] = 1 if r["maj"] else 0
-        if colonnes is not None and not colonnes:
+        if not excel_voulu:
             log_fn("  ⏭️ Excel non modifié (aucune colonne cochée)", LOG_INFO)
+        if r.get("ouverture"):
+            log_fn(f"  🔗 {nom_dst} ouvert dans Excel ({r['ouverture']})", LOG_INFO)
+        if r.get("bloque"):
+            restants = [i for i in ids if i not in r["absents_src"]]
+            stats["err"] += 1
+            echec(restants, f"Excel ouvert en mode exclusif par {r['bloque']}")
+            log_fn(f"    🔒 {nom_dst} est ouvert en mode exclusif par {r['bloque']} → rien n'a été écrit, "
+                   f"{len(restants)} ID mis en attente (si c'est vous, fermez le fichier puis rejouez)", LOG_WARN)
         if r["maj"]:
             quoi = "toutes colonnes" if colonnes is None else f"{len(colonnes)} colonne(s)"
-            log_fn(f"  📊 {len(r['maj'])} ligne(s) mise(s) à jour ({quoi}) dans {dep}/{commune}/{os.path.basename(excel_dst)}", LOG_OK)
+            verif = ", valeurs vérifiées" if "non_verifies" in r else ""
+            log_fn(f"  📊 {len(r['maj'])} ligne(s) mise(s) à jour ({quoi}{verif}) dans {dep}/{commune}/{nom_dst}", LOG_OK)
+        if r.get("non_verifies"):
+            stats["err"] += len(r["non_verifies"])
+            echec(r["non_verifies"], "valeurs non confirmées après enregistrement")
+            log_fn(f"    ⚠️ Valeurs non confirmées après enregistrement : {', '.join(r['non_verifies'])}", LOG_WARN)
         if r["col_absentes"]:
             log_fn(f"    ⚠️ Colonne(s) cochée(s) absente(s) d'un des deux Excel, ignorée(s) : {', '.join(r['col_absentes'])}", LOG_WARN)
         if r["absents_src"]:
             stats["err"] += len(r["absents_src"])
+            echec(r["absents_src"], "absent de l'Excel Prod IA")
             log_fn(f"    ⚠️ Absent(s) de l'Excel Prod IA : {', '.join(r['absents_src'])}", LOG_WARN)
         if r["absents_dst"]:
             stats["err"] += len(r["absents_dst"])
+            echec(r["absents_dst"], "absent de l'Excel SharePoint")
             log_fn(f"    ⚠️ Absent(s) de l'Excel SharePoint (non ajoutés) : {', '.join(r['absents_dst'])}", LOG_WARN)
     except PermissionError:
         stats["err"] += 1
-        log_fn(f"    ⚠️ {os.path.basename(excel_dst)} verrouillé (ouvert dans Excel ?)", LOG_WARN)
+        if excel_voulu: echec(ids, f"{nom_dst} verrouillé")
+        log_fn(f"    ⚠️ {nom_dst} verrouillé (ouvert dans Excel ?)", LOG_WARN)
     except Exception as e:
         stats["err"] += 1
+        if excel_voulu: echec(ids, f"erreur Excel : {e}")
         log_fn(f"    ❌ Erreur Excel : {e}", LOG_ERR)
     phase("excel", "ok" if stats["err"] == 0 else "err")
 
@@ -171,7 +197,7 @@ def ranger_ids(root_sp, commune, dossier_src, ids, ppt_mode, supprimer, log_fn, 
             try:
                 if ppt_mode == "remplacer" or not os.path.isfile(dst):
                     if not os.path.isfile(src):
-                        stats["err"] += 1
+                        stats["err"] += 1; echec([id_err], "PPT absent de Prod IA")
                         log_fn(f"    ⚠️ {nom} absent de Prod IA/{commune}", LOG_WARN); continue
                     if ppt_mode == "modifier":
                         log_fn(f"    ℹ️ {nom} absent de SharePoint → copie du nouveau PPT", LOG_INFO)
@@ -179,7 +205,7 @@ def ranger_ids(root_sp, commune, dossier_src, ids, ppt_mode, supprimer, log_fn, 
                     continue
                 d = donnees.get(id_err.upper())
                 if d is None:
-                    stats["err"] += 1
+                    stats["err"] += 1; echec([id_err], "PPT non modifié (ID absent de l'Excel Prod IA)")
                     log_fn(f"    ⚠️ {id_err} absent de l'Excel Prod IA → {nom} non modifié", LOG_WARN); continue
                 analyse, lien = d[COL_REMARQUE] or None, d[COL_LIEN_SV] or None
                 if analyse is None and lien is None:
@@ -190,17 +216,17 @@ def ranger_ids(root_sp, commune, dossier_src, ids, ppt_mode, supprimer, log_fn, 
                                              ("Lien Street View", lien, res["lien"])) if v and not ok]
                 vides = [c for c, v in ((COL_REMARQUE, analyse), (COL_LIEN_SV, lien)) if not v]
                 if manque:
-                    stats["err"] += 1
+                    stats["err"] += 1; echec([id_err], f"PPT : zone(s) introuvable(s) {', '.join(manque)}")
                     log_fn(f"    ⚠️ {nom} : zone(s) introuvable(s) : {', '.join(manque)}", LOG_WARN)
                 if vides:
                     log_fn(f"    ℹ️ {id_err} : « {', '.join(vides)} » vide → zone laissée telle quelle", LOG_INFO)
                 if res["analyse"] or res["lien"]:
                     onedrive_pin(dst); stats["ppt"] += 1
             except PermissionError:
-                stats["err"] += 1
+                stats["err"] += 1; echec([id_err], "PPT verrouillé")
                 log_fn(f"    ⚠️ {nom} verrouillé (ouvert dans PowerPoint ?)", LOG_WARN)
             except Exception as e:
-                stats["err"] += 1
+                stats["err"] += 1; echec([id_err], f"PPT : {e}")
                 log_fn(f"    ❌ {nom} : {e}", LOG_ERR)
         verbe = "remplacé(s)" if ppt_mode == "remplacer" else "modifié(s)"
         log_fn(f"  🖼️  {stats['ppt']} PPT {verbe} → {dep}/{commune}/{PPT_FOLDER}/", LOG_OK)

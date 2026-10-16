@@ -9,11 +9,15 @@ import time as _time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from ..config import load_config, save_config
+from contextlib import nullcontext
+
+from ..config import load_config, save_config, ATTENTE_FILE
+from ..services import attente
 from ..services.chemins import get_dep, lister_communes_prod, detecter_colonnes, supprimer_si_vide
 from ..services.constantes import COL_ID_ERR
 from ..services.dispatcher import ranger_commune, ranger_ids
 from ..services.error_ids import extraire_ids
+from ..services.excel_com import SessionExcel, ExcelIndisponible, excel_disponible
 from .theme import (C_ACCENT, C_AMBER, C_BG, C_BORDER, C_BORDER2, C_CARD, C_CYAN, C_GREEN, C_MUTED,
                     C_PANEL, C_PANEL2, C_PURPLE, C_RED, C_TEXT, C_TEXT2, F_BODY, F_MONO, F_TITLE)
 
@@ -29,6 +33,7 @@ class App(tk.Tk):
         self.minsize(960, 640)
         self.configure(bg=C_BG)
         self.cfg = load_config()
+        self._excel_ok = excel_disponible()
         self._debug_visible = False
         self._t_start = None
         self._logq = []
@@ -160,6 +165,19 @@ class App(tk.Tk):
         self.lbl_ids = tk.Label(self.frm_ids, text="", bg=C_CARD, fg=C_MUTED, font=(F_BODY,8))
         self.lbl_ids.pack(anchor="w")
 
+        # ID non appliqués lors d'un précédent dispatch (fichier verrouillé, etc.)
+        att = tk.Frame(self.frm_ids, bg=C_CARD); att.pack(fill="x", pady=(4,0))
+        self.lbl_attente = tk.Label(att, text="", bg=C_CARD, fg=C_MUTED, font=(F_BODY,9,"bold"))
+        self.lbl_attente.pack(side="left")
+        self.btn_att_vider = tk.Button(att, text="🗑 Vider la liste", command=self._vider_attente, bg=C_PANEL2,
+                                       fg=C_TEXT2, font=(F_BODY,8), relief="flat", cursor="hand2", padx=10, pady=2)
+        self.btn_att_vider.pack(side="right", padx=(6,0))
+        self.btn_att_charger = tk.Button(att, text="📋 Charger les ID en attente", command=self._charger_attente,
+                                         bg=C_PANEL2, fg=C_TEXT2, font=(F_BODY,8), relief="flat", cursor="hand2",
+                                         padx=10, pady=2)
+        self.btn_att_charger.pack(side="right", padx=(6,0))
+        self._maj_attente_ui()
+
         # Colonnes Excel à mettre à jour
         colh = tk.Frame(self.frm_ids, bg=C_CARD); colh.pack(fill="x", pady=(10,0))
         tk.Label(colh, text="Colonnes Excel à mettre à jour :", bg=C_CARD, fg=C_MUTED,
@@ -173,6 +191,18 @@ class App(tk.Tk):
                                  wraplength=900)
         self.lbl_cols.pack(anchor="w")
         self._col_vars = {}
+
+        # Mode d'écriture Excel
+        erow = tk.Frame(self.frm_ids, bg=C_CARD); erow.pack(fill="x", pady=(8,0))
+        self.var_excel_com = tk.BooleanVar(value=bool(self.cfg.get("excel_com", True)) and self._excel_ok)
+        cb = self._check(erow, "🔐 Écrire via Excel (co-édition SharePoint)", self.var_excel_com, self._save_cfg)
+        aide = ("modifications appliquées même si un collègue a le fichier ouvert, valeurs vérifiées après "
+                "enregistrement · décoché : réécriture du fichier (perdue si le fichier est ouvert ailleurs)")
+        if not self._excel_ok:
+            cb.config(state="disabled")
+            aide = "indisponible : Excel ou pywin32 absent → réécriture du fichier"
+        tk.Label(self.frm_ids, text=f"  {aide}", bg=C_CARD, fg=C_MUTED if self._excel_ok else C_AMBER,
+                 font=(F_BODY,8), justify="left", wraplength=900).pack(anchor="w")
 
         prow = tk.Frame(self.frm_ids, bg=C_CARD); prow.pack(fill="x", pady=(10,0))
         tk.Label(prow, text="PPT :", bg=C_CARD, fg=C_MUTED, font=(F_BODY,9,"bold")).pack(side="left", padx=(0,4))
@@ -244,9 +274,11 @@ class App(tk.Tk):
         setattr(self, f"ent_{key}", ent)
 
     def _check(self, parent, text, var, command):
-        tk.Checkbutton(parent, text=f"  {text}", variable=var, bg=C_CARD, fg=C_TEXT2, selectcolor=C_PANEL2,
-                       activebackground=C_CARD, activeforeground=C_TEXT, font=(F_BODY,10),
-                       relief="flat", cursor="hand2", command=command).pack(side="left", padx=(0,12))
+        cb = tk.Checkbutton(parent, text=f"  {text}", variable=var, bg=C_CARD, fg=C_TEXT2, selectcolor=C_PANEL2,
+                            activebackground=C_CARD, activeforeground=C_TEXT, font=(F_BODY,10),
+                            relief="flat", cursor="hand2", command=command)
+        cb.pack(side="left", padx=(0,12))
+        return cb
 
     # ── Mode ID erreur ──
     def _by_ids(self):
@@ -270,6 +302,29 @@ class App(tk.Tk):
         if which == "rempl" and self.var_ppt_rempl.get(): self.var_ppt_modif.set(False)
         if which == "modif" and self.var_ppt_modif.get(): self.var_ppt_rempl.set(False)
         self._save_cfg()
+    # ── ID en attente ──
+    def _maj_attente_ui(self):
+        n = len(attente.charger(ATTENTE_FILE))
+        if n:
+            self.lbl_attente.config(text=f"⏳ {n} ID en attente (non appliqués lors d'un précédent dispatch)", fg=C_AMBER)
+        else:
+            self.lbl_attente.config(text="✓ Aucun ID en attente", fg=C_MUTED)
+        for b in (self.btn_att_charger, self.btn_att_vider):
+            b.config(state="normal" if n else "disabled")
+    def _charger_attente(self):
+        d = attente.charger(ATTENTE_FILE)
+        if not d: return self._maj_attente_ui()
+        self.txt_ids.delete("1.0", "end"); self.txt_ids.insert("1.0", "\n".join(d))
+        detail = "\n".join(f"• {i} : {v.get('raison','')} ({v.get('date','')})" for i, v in list(d.items())[:15])
+        plus = f"\n… et {len(d)-15} autre(s)" if len(d) > 15 else ""
+        messagebox.showinfo("ID en attente", f"{len(d)} ID chargé(s) dans la zone de saisie.\n\n{detail}{plus}\n\n"
+                            "Cliquez sur « Mettre à jour les ID erreur » pour les rejouer : ceux qui réussissent "
+                            "sont retirés de la liste.")
+    def _vider_attente(self):
+        if messagebox.askyesno("ID en attente", "Vider la liste des ID en attente ?\n"
+                               "(les fichiers ne sont pas modifiés, seule la liste est effacée)"):
+            attente.vider(ATTENTE_FILE); self._maj_attente_ui()
+
     # ── Colonnes Excel ──
     def _detect_cols(self):
         """Lit les en-têtes en tâche de fond (OneDrive peut devoir télécharger le fichier)."""
@@ -368,6 +423,8 @@ class App(tk.Tk):
             self.cfg["mode"]=self.var_mode.get()
             self.cfg["ppt_remplacer"]=bool(self.var_ppt_rempl.get())
             self.cfg["ppt_modifier"]=bool(self.var_ppt_modif.get())
+        if hasattr(self, "var_excel_com") and self._excel_ok:
+            self.cfg["excel_com"]=bool(self.var_excel_com.get())
         if getattr(self, "_col_vars", None):
             # garde aussi les choix des colonnes absentes du fichier détecté
             anciens = self.cfg.get("colonnes_maj") or []
@@ -585,47 +642,83 @@ class App(tk.Tk):
             messagebox.showinfo("Rien à faire", "Aucune colonne Excel cochée et aucune option PPT : rien à mettre à jour."); return
         supp_txt = ("supprimés de Prod IA (s'ils ne contiennent pas d'autres ID)" if supprimer
                     else "conservés dans Prod IA")
+        excel_com = bool(self.var_excel_com.get()) and self._excel_ok
+        ecriture_txt = ("Écriture → via Excel, en co-édition SharePoint (valeurs vérifiées)" if excel_com
+                        else "Écriture → réécriture du fichier (⚠️ perdue si le fichier est ouvert ailleurs)")
         if not messagebox.askyesno("Mise à jour par ID erreur",
                 f"Mettre à jour {nb} ID erreur sur {len(codes)} commune(s) : {', '.join(codes)} ?\n\n"
                 f"• {excel_txt}\n"
+                f"• {ecriture_txt}\n"
                 f"• {ppt_txt}\n"
                 f"• Dossiers {supp_txt}\n\n"
-                "⚠️ Cette action écrase des données SharePoint."): return
+                "Les ID non appliqués seront ajoutés à la liste « ID en attente »."): return
 
         self._start_ui(len(codes), "Mise à jour ID", "🎯 MISE À JOUR PAR ID EN COURS")
 
         def do():
             tot={"mode":"ids","communes":0,"lignes":0,"excel":0,"ppt":0,"err":0}
+            echecs, reussis = {}, []
             self._log(f"\n🎯 MISE À JOUR de {nb} ID erreur sur {len(codes)} commune(s)", C_ACCENT)
             self._log(f"📂 Source : {prod_ia}", C_MUTED)
             self._log(f"📂 Cible  : {root_sp}\\DepXX\\commune", C_MUTED)
             self._log(f"📊 {excel_txt}", C_MUTED)
+            self._log(f"🔐 {ecriture_txt}", C_MUTED)
             self._log(f"🖼️  {ppt_txt}", C_MUTED)
             self._log("─"*50, C_MUTED)
-            for i,commune in enumerate(codes,1):
-                ids = groupes[commune]; dep = get_dep(commune)
-                self._state["gpos"]=i-1
-                self._state["prog"]=f"Commune {i}/{len(codes)} — {commune} ({len(ids)} ID)"
-                self._state["row_insert"]=commune
-                self._log(f"\n📍 Commune {commune}  ({i}/{len(codes)}) — {', '.join(ids)}", C_AMBER)
-                stats = ranger_ids(root_sp, commune, dispo.get(commune), ids, ppt_mode,
-                                   supprimer, self._log, phase_fn=self._cb_phase, colonnes=colonnes)
-                self._state["gpos"]=i
-                if stats is not None:
-                    tot["communes"]+=1
-                    for k in ("lignes","excel","ppt","err"): tot[k]+=stats[k]
-                    ok = stats["err"]==0
-                    statut = "✅ Mis à jour" if ok else f"⚠️ {stats['err']} erreur(s)"
-                    self._state["row_update"] = ((commune,dep,len(ids),stats["excel"],stats["lignes"],
-                                                  stats["ppt"],stats["err"],statut), ok)
-                else:
-                    tot["err"]+=1
-                    self._state["row_update"] = ((commune,dep,len(ids),"","","","","❌ Non traité"), False)
-                self._state["stats"]=dict(tot)
+            session = SessionExcel(visible=self.cfg.get("excel_visible", False)) if excel_com else nullcontext()
+            try:
+                with session as xl:
+                    for i,commune in enumerate(codes,1):
+                        ids = groupes[commune]; dep = get_dep(commune)
+                        self._state["gpos"]=i-1
+                        self._state["prog"]=f"Commune {i}/{len(codes)} — {commune} ({len(ids)} ID)"
+                        self._state["row_insert"]=commune
+                        self._log(f"\n📍 Commune {commune}  ({i}/{len(codes)}) — {', '.join(ids)}", C_AMBER)
+                        stats = ranger_ids(root_sp, commune, dispo.get(commune), ids, ppt_mode,
+                                           supprimer, self._log, phase_fn=self._cb_phase, colonnes=colonnes,
+                                           maj_excel=xl.maj_lignes if xl else None)
+                        self._state["gpos"]=i
+                        if stats is not None:
+                            tot["communes"]+=1
+                            for k in ("lignes","excel","ppt","err"): tot[k]+=stats[k]
+                            echecs.update(stats["echecs"])
+                            reussis += [x for x in ids if x not in stats["echecs"]]
+                            ok = stats["err"]==0
+                            if any("mode exclusif" in r for r in stats["echecs"].values()):
+                                statut = "🔒 Verrouillé"
+                            else:
+                                statut = "✅ Mis à jour" if ok else f"⚠️ {stats['err']} erreur(s)"
+                            self._state["row_update"] = ((commune,dep,len(ids),stats["excel"],stats["lignes"],
+                                                          stats["ppt"],stats["err"],statut), ok)
+                        else:
+                            tot["err"]+=1
+                            echecs.update({x: "commune non traitée (voir journal)" for x in ids})
+                            self._state["row_update"] = ((commune,dep,len(ids),"","","","","❌ Non traité"), False)
+                        self._state["stats"]=dict(tot)
+            except ExcelIndisponible as e:
+                tot["err"]+=1
+                echecs.update({x: f"Excel indisponible : {e}" for c in codes for x in groupes[c] if x not in reussis})
+                self._log(f"\n❌ {e} — aucune écriture Excel faite. Décochez « Écrire via Excel » pour "
+                          "utiliser la réécriture du fichier.", C_RED)
+            except Exception as e:
+                tot["err"]+=1
+                echecs.update({x: f"interrompu : {e}" for c in codes for x in groupes[c]
+                               if x not in reussis and x not in echecs})
+                self._log(f"\n❌ Traitement interrompu : {e}", C_RED)
             el=_time.time()-self._t_start
+            liste = attente.mettre_a_jour(ATTENTE_FILE, echecs, reussis)
             self._log(f"\n🎉 TERMINÉ — {tot['communes']} commune(s) en {self._fmt(el)}", C_GREEN)
             self._log(f"  Lignes:{tot['lignes']} · PPT:{tot['ppt']} · Erreurs:{tot['err']}", C_MUTED)
+            if echecs:
+                self._log(f"\n⏳ {len(echecs)} ID non appliqué(s) → ajoutés à la liste « ID en attente » "
+                          f"({len(liste)} au total) :", C_AMBER)
+                for x, raison in list(echecs.items())[:50]:
+                    self._log(f"   • {x} : {raison}", C_AMBER)
+            else:
+                self._log(f"\n✅ Tous les ID ont été appliqués" +
+                          (f" · {len(liste)} ID restent en attente d'un précédent dispatch" if liste else ""), C_GREEN)
             self._supprimer_adeposer(prod_ia)
+            tot["echecs"]=len(echecs); tot["attente"]=len(liste)
             tot["_el"]=el; self._state["done"]=tot
 
         threading.Thread(target=do, daemon=True).start()
@@ -653,12 +746,20 @@ class App(tk.Tk):
         self.btn_run.config(state="normal"); self._set_hdr("Prêt", C_GREEN)
         par_ids = tot.get("mode") == "ids"
         detail = f"{tot['lignes']} ligne(s)" if par_ids else f"{tot['ppt']} PPT"
-        self._set_status(f"🎉 TERMINÉ — {tot['communes']} commune(s) · {detail} en {self._fmt(el)}", C_GREEN, "#0a2018")
+        if tot.get("echecs"):
+            self._set_status(f"⚠️ TERMINÉ — {detail} · {tot['echecs']} ID non appliqué(s) → voir « ID en attente »",
+                             C_AMBER, "#1f1608")
+        else:
+            self._set_status(f"🎉 TERMINÉ — {tot['communes']} commune(s) · {detail} en {self._fmt(el)}", C_GREEN, "#0a2018")
         try: self.bell()
         except: pass
         if par_ids:
-            corps = (f"✅ {tot['communes']} commune(s) mise(s) à jour en {self._fmt(el)}\n\n"
-                     f"Lignes Excel remplacées : {tot['lignes']}\nPPT traités : {tot['ppt']}\n")
+            self._maj_attente_ui()
+            icone = "⚠️" if tot.get("echecs") else "✅"
+            corps = (f"{icone} {tot['communes']} commune(s) traitée(s) en {self._fmt(el)}\n\n"
+                     f"Lignes Excel mises à jour : {tot['lignes']}\nPPT traités : {tot['ppt']}\n"
+                     f"ID non appliqués : {tot.get('echecs', 0)}"
+                     + (" → liste « ID en attente » (détail dans le journal)\n" if tot.get("echecs") else "\n"))
         else:
             corps = (f"✅ {tot['communes']} commune(s) rangée(s) en {self._fmt(el)}\n\n"
                      f"Excel remplacés : {tot['excel']}\nPPT déposés : {tot['ppt']}\n")

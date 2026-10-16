@@ -34,6 +34,42 @@ rempli + `cas_analyse_<ID>.pptx`) dans l'arborescence SharePoint
   - Le dossier Prod IA de la commune n'est supprimé que si tout a réussi **et**
     qu'il ne contient pas d'autres ID que ceux saisis.
 
+### Modifications persistantes quand le fichier est ouvert par un collègue
+
+Réécrire le fichier entier puis laisser OneDrive l'envoyer échoue dès qu'un autre
+utilisateur a le classeur ouvert : OneDrive ne sait pas fusionner un fichier
+produit hors d'Office (conflit, copie `-NOMDUPC`, ou envoi refusé). Les
+modifications restaient alors dans le OneDrive local.
+
+Case **🔐 Écrire via Excel (co-édition SharePoint)**, cochée par défaut
+(`services/excel_com.py`, nécessite Excel + `pywin32`) :
+
+1. une instance Excel dédiée et invisible est lancée. L'Excel déjà ouvert sur le
+   poste n'est jamais touché ;
+2. le classeur est ouvert **par son adresse SharePoint**, retrouvée à partir
+   des dossiers synchronisés par OneDrive (`services/onedrive.py`), donc dans
+   la session de co-édition. Si l'adresse n'est pas trouvée, il est ouvert par
+   le chemin local ;
+3. seules les cellules (ID × colonnes cochées) sont écrites : valeurs, formules
+   recalées, liens, formats de nombre. Les couleurs et polices ne sont pas
+   recopiées ;
+4. après l'enregistrement, chaque cellule est **relue** : un ID n'est compté
+   comme mis à jour que si toutes ses valeurs sont en place ;
+5. si le classeur est ouvert en **mode exclusif** ailleurs, Excel l'ouvre en
+   lecture seule : rien n'est écrit, et l'ID est signalé avec le nom de la
+   personne qui bloque.
+
+**ID en attente** : tout ID non appliqué (fichier bloqué, valeur non confirmée,
+ID introuvable, PPT en erreur…) est enregistré avec sa raison dans
+`ids_en_attente.json`. Le bouton *📋 Charger les ID en attente* les remet dans
+la zone de saisie pour les rejouer. Ceux qui réussissent sont retirés de la
+liste. Le dossier Prod IA d'une commune en échec est conservé, ce qui permet
+de rejouer.
+
+Décocher la case revient à l'ancienne réécriture du fichier (openpyxl).
+`"excel_visible": true` dans `config_dispatcher.json` affiche Excel pendant le
+traitement (diagnostic).
+
 ## Structure
 
 ```
@@ -44,6 +80,9 @@ dispatch_sna/
 │   ├── constantes.py        #   préfixes Dep/audit_/cas_analyse_, noms de colonnes
 │   ├── error_ids.py         #   extraction des ID erreur, regroupés par commune
 │   ├── excel_rows.py        #   en-têtes, lecture et remplacement des lignes (openpyxl)
+│   ├── excel_com.py         #   écriture cellule par cellule via Excel, en co-édition + vérification
+│   ├── onedrive.py          #   dossier synchronisé local → adresse SharePoint
+│   ├── attente.py           #   liste persistante des ID non appliqués
 │   ├── ppt_editor.py        #   réécriture Analyse / Lien Street View (XML du .pptx)
 │   ├── chemins.py           #   arborescence Prod IA / SharePoint, copies, détection des colonnes
 │   └── dispatcher.py        #   orchestration : ranger_commune / ranger_ids

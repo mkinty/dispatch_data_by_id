@@ -2,7 +2,9 @@
 import json
 import os
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config_dispatcher.json")
+RACINE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CONFIG_FILE = os.path.join(RACINE, "config_dispatcher.json")
+ATTENTE_FILE = os.path.join(RACINE, "ids_en_attente.json")   # ID non appliqués, à rejouer
 
 DEFAULT_CFG = {
     "root_sp":  r"C:\Users\u269775\Altice Campus SFR\Swap Adresse - Etude Cible\audit_SNA",
@@ -13,6 +15,8 @@ DEFAULT_CFG = {
     "ppt_remplacer": False, # mode ids : remplacer les PPT par ceux de Prod IA
     "ppt_modifier": True,   # mode ids : modifier Analyse + Lien Street View
     "colonnes_maj": None,   # mode ids : colonnes Excel à mettre à jour (None = toutes)
+    "excel_com": True,      # mode ids : écrire via Excel (co-édition SharePoint) plutôt que réécrire le fichier
+    "excel_visible": False, # mode ids : afficher Excel pendant l'écriture (diagnostic)
 }
 
 
