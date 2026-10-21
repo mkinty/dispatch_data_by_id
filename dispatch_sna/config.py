@@ -17,6 +17,7 @@ DEFAULT_CFG = {
     "colonnes_maj": None,   # mode ids : colonnes Excel à mettre à jour (None = toutes)
     "excel_com": True,      # mode ids : écrire via Excel (co-édition SharePoint) plutôt que réécrire le fichier
     "excel_visible": False, # mode ids : afficher Excel pendant l'écriture (diagnostic)
+    "excel_delai_occupe_s": 120,  # mode ids : attente max quand Excel répond « occupé » (par appel)
 }
 
 

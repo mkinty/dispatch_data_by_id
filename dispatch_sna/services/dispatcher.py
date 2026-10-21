@@ -146,6 +146,8 @@ def ranger_ids(root_sp, commune, dossier_src, ids, ppt_mode, supprimer, log_fn, 
             log_fn("  ⏭️ Excel non modifié (aucune colonne cochée)", LOG_INFO)
         if r.get("ouverture"):
             log_fn(f"  🔗 {nom_dst} ouvert dans Excel ({r['ouverture']})", LOG_INFO)
+        if r.get("tentatives", 1) > 1:
+            log_fn(f"    ℹ️ Excel était occupé : réussi au {r['tentatives']}e essai", LOG_INFO)
         if r.get("bloque"):
             restants = [i for i in ids if i not in r["absents_src"]]
             stats["err"] += 1

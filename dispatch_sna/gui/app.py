@@ -665,7 +665,9 @@ class App(tk.Tk):
             self._log(f"🔐 {ecriture_txt}", C_MUTED)
             self._log(f"🖼️  {ppt_txt}", C_MUTED)
             self._log("─"*50, C_MUTED)
-            session = SessionExcel(visible=self.cfg.get("excel_visible", False)) if excel_com else nullcontext()
+            session = (SessionExcel(visible=self.cfg.get("excel_visible", False),
+                                    delai_occupe_s=self.cfg.get("excel_delai_occupe_s", 120))
+                       if excel_com else nullcontext())
             try:
                 with session as xl:
                     for i,commune in enumerate(codes,1):

@@ -66,6 +66,21 @@ la zone de saisie pour les rejouer. Ceux qui réussissent sont retirés de la
 liste. Le dossier Prod IA d'une commune en échec est conservé, ce qui permet
 de rejouer.
 
+**Excel occupé (« L'appel a été rejeté par l'appelé », -2147418111)** : quand
+Excel est en train de charger un classeur SharePoint, de se synchroniser avec
+les co-éditeurs, de recalculer ou d'enregistrer, il refuse les commandes
+(`RPC_E_CALL_REJECTED`). L'outil s'en protège de trois façons :
+
+1. un **filtre de messages COM** (`_FiltreMessages`, `IMessageFilter` via
+   ctypes) fait réessayer chaque appel refusé toutes les 250 ms, jusqu'à
+   `excel_delai_occupe_s` secondes (120 par défaut) ;
+2. le **calcul automatique est suspendu** pendant l'écriture des cellules
+   (un seul recalcul à la fin, avant l'enregistrement) et l'outil attend
+   qu'Excel soit prêt après l'ouverture et après l'enregistrement ;
+3. si Excel reste occupé malgré tout, le classeur est **retenté entièrement**
+   (3 essais). En dernier recours, les ID partent dans la liste d'attente avec
+   la raison « Excel est resté occupé ».
+
 Décocher la case revient à l'ancienne réécriture du fichier (openpyxl).
 `"excel_visible": true` dans `config_dispatcher.json` affiche Excel pendant le
 traitement (diagnostic).

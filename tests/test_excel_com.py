@@ -62,6 +62,70 @@ def test_fichier_ouvert_ailleurs_est_signale_sans_rien_ecrire(tmp_path):
     assert open(dst, "rb").read() == avant
 
 
+def test_excel_occupe_l_appel_attend_au_lieu_d_echouer():
+    """Reproduit « L'appel a été rejeté par l'appelé » : un autre client occupe Excel
+    (gros recalcul) pendant que l'outil écrit. Grâce au filtre de messages, l'écriture
+    attend qu'Excel soit libre puis réussit."""
+    import threading, time
+    import pythoncom, win32com.client as wc
+
+    with SessionExcel() as s:
+        wb = s.xl.Workbooks.Add()
+        cible = wb.ActiveSheet.Range("L1")
+        flux = pythoncom.CoMarshalInterThreadInterfaceInStream(pythoncom.IID_IDispatch, s.xl._oleobj_)
+        fini = []
+
+        def occupe():
+            pythoncom.CoInitialize()
+            x = wc.Dispatch(pythoncom.CoGetInterfaceAndReleaseStream(flux, pythoncom.IID_IDispatch))
+            x.ActiveSheet.Range("A1:J150000").Formula = "=SQRT(ROW()*COLUMN())*RAND()"
+            fini.append(time.time()); x = None
+            pythoncom.CoUninitialize()
+
+        th = threading.Thread(target=occupe); th.start(); time.sleep(1.0)
+        cible.Value = "ecrit pendant l'occupation"   # sans filtre : com_error -2147418111
+        ecrit = time.time()
+        th.join()
+        assert cible.Value == "ecrit pendant l'occupation"
+        assert fini and ecrit >= fini[0] - 0.5         # l'écriture a bien attendu la fin du calcul
+        cible = None; wb.Close(False); wb = None
+
+
+def test_classeur_retente_si_excel_reste_occupe(tmp_path, monkeypatch):
+    import pywintypes
+    from dispatch_sna.services import excel_com
+    src, dst = _fichiers(tmp_path)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    rejet = pywintypes.com_error(excel_com.RPC_E_CALL_REJECTED, "L'appel a été rejeté par l'appelé.", None, None)
+    s = SessionExcel()
+    appels = []
+
+    def une_fois(lecture, dst, colonnes):
+        appels.append(1)
+        if len(appels) < 3:
+            raise rejet
+        return {"maj": ["74143_2"]}
+
+    monkeypatch.setattr(s, "_maj_une_fois", une_fois)
+    assert s.maj_lignes(src, dst, ["74143_2"], ["Remarque"]) == {"maj": ["74143_2"], "tentatives": 3}
+
+    monkeypatch.setattr(s, "_maj_une_fois", lambda *a: (_ for _ in ()).throw(rejet))
+    with pytest.raises(excel_com.ExcelOccupe, match="resté occupé"):
+        s.maj_lignes(src, dst, ["74143_2"], ["Remarque"])
+
+
+def test_autre_erreur_n_est_pas_retentee(tmp_path, monkeypatch):
+    src, dst = _fichiers(tmp_path)
+    s = SessionExcel()
+    appels = []
+    def une_fois(*a):
+        appels.append(1); raise ValueError("colonne « ID erreur » absente")
+    monkeypatch.setattr(s, "_maj_une_fois", une_fois)
+    with pytest.raises(ValueError):
+        s.maj_lignes(src, dst, ["74143_2"], ["Remarque"])
+    assert len(appels) == 1
+
+
 def test_aucune_colonne_n_ouvre_pas_le_classeur(tmp_path):
     src, dst = _fichiers(tmp_path)
     with SessionExcel() as xl:
