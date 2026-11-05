@@ -650,6 +650,7 @@ class App(tk.Tk):
                 f"• {excel_txt}\n"
                 f"• {ecriture_txt}\n"
                 f"• {ppt_txt}\n"
+                "• Onglet Audit → filtres retirés, lignes et colonnes masquées réaffichées\n"
                 f"• Dossiers {supp_txt}\n\n"
                 "Les ID non appliqués seront ajoutés à la liste « ID en attente »."): return
 

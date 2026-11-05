@@ -81,6 +81,14 @@ les co-éditeurs, de recalculer ou d'enregistrer, il refuse les commandes
    (3 essais). En dernier recours, les ID partent dans la liste d'attente avec
    la raison « Excel est resté occupé ».
 
+**Filtres et colonnes masquées** : à chaque mise à jour par ID, dans l'onglet
+`Audit` uniquement, l'outil retire les critères de filtre (tableaux Excel
+compris) et réaffiche les lignes et colonnes masquées, côté Prod IA comme côté
+SharePoint. Les flèches de filtre restent en place. Le journal indique chaque
+retrait (🧹). Si aucune colonne n'est cochée, le fichier SharePoint n'est pas
+ouvert et ses filtres restent. L'onglet `Audit` est obligatoire : s'il manque,
+l'erreur le dit et aucun autre onglet n'est utilisé à sa place.
+
 Décocher la case revient à l'ancienne réécriture du fichier (openpyxl).
 `"excel_visible": true` dans `config_dispatcher.json` affiche Excel pendant le
 traitement (diagnostic).

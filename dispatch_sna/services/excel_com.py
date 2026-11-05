@@ -20,12 +20,12 @@ from urllib.parse import unquote
 from openpyxl.utils import get_column_letter
 
 from .constantes import ONGLET_AUDIT, COL_ID_ERR
-from .excel_rows import lire_cellules, formule_pour, _norm
+from .excel_rows import ExcelErreur, affichage_modifie, lire_cellules, formule_pour, _norm
 from .onedrive import url_sharepoint
 
 _EN = 1033                 # propriétés NumberFormat / Formula toujours en anglais (sinon « General » est refusé en français)
-_XL_UP, _XL_TO_LEFT = -4162, -4159
 _XL_CALC_MANUEL = -4135
+_XL_CELLULES_VISIBLES = 12
 _EPOQUE = _dt.datetime(1899, 12, 30)
 
 
@@ -309,12 +309,61 @@ class SessionExcel:
 
     @staticmethod
     def _onglet(wb):
+        """Onglet « Audit » uniquement : jamais de repli sur l'onglet actif."""
         cible = "".join(ONGLET_AUDIT.split()).casefold()
+        noms = []
         for i in range(1, wb.Worksheets.Count + 1):
             ws = wb.Worksheets(i)
-            if "".join(str(ws.Name).split()).casefold() == cible:
+            noms.append(str(ws.Name))
+            if "".join(noms[-1].split()).casefold() == cible:
                 return ws
-        return wb.ActiveSheet
+        raise ExcelErreur(f"onglet « {ONGLET_AUDIT} » introuvable (onglets présents : {', '.join(noms)})")
+
+    @staticmethod
+    def _retirer_filtres(ws) -> dict:
+        """Retire les filtres et réaffiche lignes et colonnes masquées de l'onglet.
+        Les flèches de filtre restent en place. Une feuille protégée n'est pas bloquante
+        ici : l'erreur est rapportée et la recherche des ID reste juste (cf. UsedRange)."""
+        res = {"filtres": False, "lignes": False, "colonnes": [], "erreurs": []}
+
+        def essai(action):
+            try:
+                action()
+            except Exception as e:
+                if _est_rejet(e):
+                    raise
+                res["erreurs"].append(str(getattr(e, "excepinfo", None) and e.excepinfo[2] or e))
+
+        def filtres():
+            if ws.FilterMode:
+                ws.ShowAllData(); res["filtres"] = True
+            for i in range(1, ws.ListObjects.Count + 1):      # tableaux Excel : filtre propre à chacun
+                af = ws.ListObjects(i).AutoFilter
+                if af is not None and af.FilterMode:
+                    af.ShowAllData(); res["filtres"] = True
+
+        # Range.Hidden vaut False sur une plage partiellement masquée : il ne dit rien ici.
+        def colonnes():
+            ur = ws.UsedRange
+            for c in range(ur.Column, ur.Column + ur.Columns.Count):
+                if ws.Columns(c).Hidden:
+                    ws.Columns(c).Hidden = False
+                    res["colonnes"].append(str(ws.Cells(1, c).Value or get_column_letter(c)))
+
+        def lignes():
+            ur = ws.UsedRange
+            try:
+                visibles = ur.Columns(1).SpecialCells(_XL_CELLULES_VISIBLES).Count
+            except Exception as e:
+                if _est_rejet(e):
+                    raise
+                visibles = 0                                  # aucune cellule visible
+            if visibles < ur.Rows.Count:
+                ur.EntireRow.Hidden = False; res["lignes"] = True
+
+        for action in (filtres, colonnes, lignes):            # colonnes avant lignes : le comptage lit la 1re colonne
+            essai(action)
+        return res
 
     def maj_lignes(self, src: str, dst: str, ids, colonnes=None) -> dict:
         """Même contrat que excel_rows.maj_lignes_excel, plus :
@@ -342,7 +391,7 @@ class SessionExcel:
         voulues = None if colonnes is None else {str(c).strip() for c in colonnes} - {COL_ID_ERR}
         res = {"maj": [], "absents_src": lecture["absents_src"], "absents_dst": [],
                "donnees": lecture["donnees"], "ids_src": lecture["ids_src"], "col_absentes": [],
-               "bloque": None, "non_verifies": [], "ouverture": None}
+               "bloque": None, "non_verifies": [], "ouverture": None, "affichage": None}
         a_ecrire = {i: c for i, c in lecture["cellules"].items() if c}
         if not a_ecrire:
             if voulues:
@@ -359,7 +408,12 @@ class SessionExcel:
                 res["bloque"] = qui or "un autre utilisateur"
                 return res
             ws = self._onglet(wb)
-            der_col = ws.Cells(1, ws.Columns.Count).End(_XL_TO_LEFT).Column
+            res["affichage"] = self._retirer_filtres(ws)
+            # UsedRange et non End(xlUp/xlToLeft) : End s'arrête à la dernière ligne / colonne
+            # VISIBLE, les ID filtrés passeraient pour absents et les colonnes masquées aussi.
+            utile = ws.UsedRange
+            der_col = utile.Column + utile.Columns.Count - 1
+            der_lig = utile.Row + utile.Rows.Count - 1
             entetes = {str(v).strip(): c for c, v in enumerate(_plat(ws.Range(ws.Cells(1, 1), ws.Cells(1, der_col)).Value), 1)
                        if v is not None and str(v).strip()}
             if COL_ID_ERR not in entetes:
@@ -367,7 +421,6 @@ class SessionExcel:
             if voulues:
                 res["col_absentes"] = sorted(voulues - (set(lecture["entetes"]) & set(entetes)))
             c_id = entetes[COL_ID_ERR]
-            der_lig = ws.Cells(ws.Rows.Count, c_id).End(_XL_UP).Row
             lignes = {}
             if der_lig >= 2:
                 for r, v in enumerate(_plat(ws.Range(ws.Cells(2, c_id), ws.Cells(der_lig, c_id)).Value), 2):
@@ -391,12 +444,18 @@ class SessionExcel:
                         continue
                     attendu = formule_pour(cel.valeur, cel.coord, f"{get_column_letter(c)}{r}")
                     cell = ws.Cells(r, c)
-                    _ecrire(ws, cell, attendu, cel.lien, cel.format)
+                    try:
+                        _ecrire(ws, cell, attendu, cel.lien, cel.format)
+                    except Exception as e:
+                        if not _est_rejet(e) and ws.ProtectContents:
+                            raise ExcelErreur(f"onglet « {ONGLET_AUDIT} » protégé : ôtez la protection "
+                                              "de la feuille puis rejouez") from e
+                        raise
                     faits.append((cell, attendu, cel.lien))
                 if faits:
                     ecrits[i] = faits
             self.xl.Calculation = calcul; calcul = None   # le fichier est enregistré avec son mode de calcul d'origine
-            if not ecrits:
+            if not ecrits and not affichage_modifie(res["affichage"]):
                 return res
             self._attendre_pret()
 

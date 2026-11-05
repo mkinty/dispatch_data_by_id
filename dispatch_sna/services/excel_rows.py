@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from openpyxl import load_workbook
 from openpyxl.formula.translate import Translator
+from openpyxl.utils import column_index_from_string, get_column_letter
 
 from .constantes import ONGLET_AUDIT, COL_ID_ERR, COL_REMARQUE, COL_LIEN_SV
 
@@ -16,12 +17,59 @@ def _norm(v) -> str:
 
 
 def trouver_onglet(wb, nom=ONGLET_AUDIT):
-    """Onglet « Audit » (espaces/casse ignorés), repli sur l'onglet actif."""
+    """Onglet « Audit » (espaces/casse ignorés). Jamais de repli sur un autre onglet :
+    l'onglet actif dépend du dernier enregistrement et pourrait être DGFIP, IPE, etc."""
     cible = "".join(nom.split()).casefold()
     for titre in wb.sheetnames:
         if "".join(titre.split()).casefold() == cible:
             return wb[titre]
-    return wb.active
+    raise ExcelErreur(f"onglet « {nom} » introuvable (onglets présents : {', '.join(wb.sheetnames)})")
+
+
+def retirer_filtres(ws) -> dict:
+    """Retire les critères de filtre et réaffiche lignes et colonnes masquées d'un onglet.
+    Les flèches de filtre restent en place. Retourne {"filtres", "lignes", "colonnes"}."""
+    res = {"filtres": bool(ws.auto_filter.filterColumn), "lignes": False, "colonnes": []}
+    ws.auto_filter.filterColumn = []
+    for table in ws.tables.values():
+        if table.autoFilter is not None and table.autoFilter.filterColumn:
+            table.autoFilter.filterColumn = []
+            res["filtres"] = True
+    for d in ws.row_dimensions.values():
+        if d.hidden:
+            d.hidden = False; res["lignes"] = True
+    for d in ws.column_dimensions.values():
+        if d.hidden:
+            d.hidden = False
+            if not d.width:
+                d.width = 13
+            debut = d.min or column_index_from_string(d.index)
+            res["colonnes"] += [str(ws.cell(1, c).value or get_column_letter(c))
+                                for c in range(debut, (d.max or debut) + 1) if c <= ws.max_column]
+    return res
+
+
+def affichage_modifie(a: dict | None) -> bool:
+    return bool(a and (a["filtres"] or a["lignes"] or a["colonnes"]))
+
+
+def retirer_filtres_fichier(chemin: str) -> dict:
+    """Retire les filtres de l'onglet Audit d'un fichier, réécrit seulement s'il y en avait."""
+    wb = load_workbook(chemin)
+    res = retirer_filtres(trouver_onglet(wb))
+    if affichage_modifie(res):
+        _enregistrer(wb, chemin)
+    return res
+
+
+def _enregistrer(wb, chemin: str):
+    tmp = chemin + ".tmp.xlsx"
+    try:
+        wb.save(tmp)
+        os.replace(tmp, chemin)
+    finally:
+        if os.path.isfile(tmp):
+            os.remove(tmp)
 
 
 def _entetes(ws) -> dict[str, int]:
@@ -147,7 +195,7 @@ def maj_lignes_excel(src: str, dst: str, ids, colonnes=None) -> dict:
     colonnes de dst ne sont pas touchées. Retourne
     {"maj": [...], "absents_src": [...], "absents_dst": [...],
      "donnees": {ID → {Remarque, Lien Street View}}, "ids_src": [...],
-     "col_absentes": [...]}.
+     "col_absentes": [...], "affichage": résultat de retirer_filtres sur dst}.
     Lève PermissionError si dst est verrouillé.
     """
     wanted = list(dict.fromkeys(_norm(i) for i in ids))
@@ -165,7 +213,8 @@ def maj_lignes_excel(src: str, dst: str, ids, colonnes=None) -> dict:
 
     res = {"maj": [], "absents_src": [], "absents_dst": [], "donnees": {},
            "ids_src": list(idx_s),
-           "col_absentes": sorted(voulues - (h_s.keys() & h_d.keys())) if voulues else []}
+           "col_absentes": sorted(voulues - (h_s.keys() & h_d.keys())) if voulues else [],
+           "affichage": retirer_filtres(ws_d) if paires else None}
     for i in wanted:
         rs = idx_s.get(i)
         if rs is None:
@@ -181,12 +230,6 @@ def maj_lignes_excel(src: str, dst: str, ids, colonnes=None) -> dict:
             _copier_cellule(ws_s.cell(rs, cs), ws_d.cell(rd, cd))
         res["maj"].append(i)
 
-    if res["maj"]:
-        tmp = dst + ".tmp.xlsx"
-        try:
-            wb_d.save(tmp)
-            os.replace(tmp, dst)
-        finally:
-            if os.path.isfile(tmp):
-                os.remove(tmp)
+    if res["maj"] or affichage_modifie(res["affichage"]):
+        _enregistrer(wb_d, dst)
     return res

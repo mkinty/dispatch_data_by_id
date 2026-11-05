@@ -7,7 +7,7 @@ from .constantes import (AUDIT_PREFIX, PPT_FOLDER, COL_REMARQUE, COL_LIEN_SV,
                          LOG_OK, LOG_INFO, LOG_WARN, LOG_ERR)
 from .chemins import get_dep, onedrive_pin, copier_remplacer
 from .error_ids import nom_ppt
-from .excel_rows import maj_lignes_excel, lire_lignes
+from .excel_rows import maj_lignes_excel, lire_lignes, retirer_filtres_fichier
 from .ppt_editor import modifier_ppt, copier_ppt
 
 
@@ -86,6 +86,19 @@ def ranger_commune(prod_ia, root_sp, commune, dossier_src, supprimer, log_fn, ph
 
 
 # ── Traitement ciblé par ID erreur ────────────────────────────────
+def _journal_affichage(a, fichier, log_fn):
+    """Trace ce que retirer_filtres a changé dans l'onglet Audit d'un fichier."""
+    if not a:
+        return
+    faits = (["filtre retiré"] if a["filtres"] else []) + (["lignes réaffichées"] if a["lignes"] else [])
+    if a["colonnes"]:
+        faits.append(f"colonnes réaffichées : {', '.join(a['colonnes'])}")
+    if faits:
+        log_fn(f"  🧹 {fichier} : {' · '.join(faits)}", LOG_INFO)
+    for e in a.get("erreurs", []):
+        log_fn(f"    ⚠️ {fichier} : filtres non retirés ({e})", LOG_WARN)
+
+
 def ranger_ids(root_sp, commune, dossier_src, ids, ppt_mode, supprimer, log_fn, phase_fn=None,
                colonnes=None, maj_excel=None):
     """Met à jour Dep/commune uniquement pour les ID erreur donnés.
@@ -138,8 +151,16 @@ def ranger_ids(root_sp, commune, dossier_src, ids, ppt_mode, supprimer, log_fn, 
     donnees, ids_src = None, []
     excel_voulu = colonnes is None or bool(colonnes)
     nom_dst = os.path.basename(excel_dst)
+    # Source : la lecture ne dépend pas des filtres, ce retrait n'est donc jamais bloquant
+    try:
+        _journal_affichage(retirer_filtres_fichier(excel_src), f"Prod IA/{commune}/{nom_src}", log_fn)
+    except PermissionError:
+        log_fn(f"    ℹ️ {nom_src} (Prod IA) ouvert ailleurs : filtres non retirés, lecture faite quand même", LOG_INFO)
+    except Exception as e:
+        log_fn(f"    ⚠️ Filtres de {nom_src} (Prod IA) non retirés : {e}", LOG_WARN)
     try:
         r = maj_excel(excel_src, excel_dst, ids, colonnes)
+        _journal_affichage(r.get("affichage"), f"{dep}/{commune}/{nom_dst}", log_fn)
         donnees, ids_src = r["donnees"], r["ids_src"]
         stats["lignes"] = len(r["maj"]); stats["excel"] = 1 if r["maj"] else 0
         if not excel_voulu:
