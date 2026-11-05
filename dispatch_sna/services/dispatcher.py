@@ -179,6 +179,8 @@ def ranger_ids(root_sp, commune, dossier_src, ids, ppt_mode, supprimer, log_fn, 
             quoi = "toutes colonnes" if colonnes is None else f"{len(colonnes)} colonne(s)"
             verif = ", valeurs vérifiées" if "non_verifies" in r else ""
             log_fn(f"  📊 {len(r['maj'])} ligne(s) mise(s) à jour ({quoi}{verif}) dans {dep}/{commune}/{nom_dst}", LOG_OK)
+        for i, cols in r.get("videes", {}).items():
+            log_fn(f"    🧽 {i} : ancienne valeur effacée, vide dans Prod IA : {', '.join(cols)}", LOG_INFO)
         if r.get("non_verifies"):
             stats["err"] += len(r["non_verifies"])
             echec(r["non_verifies"], "valeurs non confirmées après enregistrement")
@@ -230,19 +232,24 @@ def ranger_ids(root_sp, commune, dossier_src, ids, ppt_mode, supprimer, log_fn, 
                 if d is None:
                     stats["err"] += 1; echec([id_err], "PPT non modifié (ID absent de l'Excel Prod IA)")
                     log_fn(f"    ⚠️ {id_err} absent de l'Excel Prod IA → {nom} non modifié", LOG_WARN); continue
-                analyse, lien = d[COL_REMARQUE] or None, d[COL_LIEN_SV] or None
+                # Vide + colonne cochée : la zone est vidée, comme dans l'Excel. Vide + non cochée : on n'y touche pas.
+                analyse, lien = (d[col] or ("" if colonnes is None or col in colonnes else None)
+                                 for col in (COL_REMARQUE, COL_LIEN_SV))
                 if analyse is None and lien is None:
-                    log_fn(f"    ⚠️ {id_err} : « {COL_REMARQUE} » et « {COL_LIEN_SV} » vides → {nom} non modifié", LOG_WARN)
+                    log_fn(f"    ⚠️ {id_err} : « {COL_REMARQUE} » et « {COL_LIEN_SV} » vides et non cochées → {nom} non modifié", LOG_WARN)
                     continue
                 res = modifier_ppt(dst, analyse, lien)
                 manque = [z for z, v, ok in (("Analyse", analyse, res["analyse"]),
-                                             ("Lien Street View", lien, res["lien"])) if v and not ok]
-                vides = [c for c, v in ((COL_REMARQUE, analyse), (COL_LIEN_SV, lien)) if not v]
+                                             ("Lien Street View", lien, res["lien"])) if v is not None and not ok]
+                vides = [c for c, v in ((COL_REMARQUE, analyse), (COL_LIEN_SV, lien)) if v is None]
+                videes = [c for c, v in ((COL_REMARQUE, analyse), (COL_LIEN_SV, lien)) if v == ""]
                 if manque:
                     stats["err"] += 1; echec([id_err], f"PPT : zone(s) introuvable(s) {', '.join(manque)}")
                     log_fn(f"    ⚠️ {nom} : zone(s) introuvable(s) : {', '.join(manque)}", LOG_WARN)
                 if vides:
-                    log_fn(f"    ℹ️ {id_err} : « {', '.join(vides)} » vide → zone laissée telle quelle", LOG_INFO)
+                    log_fn(f"    ℹ️ {id_err} : « {', '.join(vides)} » vide et non cochée → zone du PPT laissée telle quelle", LOG_INFO)
+                if videes:
+                    log_fn(f"    🧽 {nom} : zone vidée, « {', '.join(videes)} » vide dans Prod IA", LOG_INFO)
                 if res["analyse"] or res["lien"]:
                     onedrive_pin(dst); stats["ppt"] += 1
             except PermissionError:

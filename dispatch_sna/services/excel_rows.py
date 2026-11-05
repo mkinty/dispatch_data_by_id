@@ -195,7 +195,9 @@ def maj_lignes_excel(src: str, dst: str, ids, colonnes=None) -> dict:
     colonnes de dst ne sont pas touchées. Retourne
     {"maj": [...], "absents_src": [...], "absents_dst": [...],
      "donnees": {ID → {Remarque, Lien Street View}}, "ids_src": [...],
-     "col_absentes": [...], "affichage": résultat de retirer_filtres sur dst}.
+     "col_absentes": [...], "affichage": résultat de retirer_filtres sur dst,
+     "videes": {ID → [colonnes dont l'ancienne valeur a été effacée]}}.
+    Une colonne cochée vide dans src efface donc la valeur de dst.
     Lève PermissionError si dst est verrouillé.
     """
     wanted = list(dict.fromkeys(_norm(i) for i in ids))
@@ -212,7 +214,7 @@ def maj_lignes_excel(src: str, dst: str, ids, colonnes=None) -> dict:
               if n in h_s and n != COL_ID_ERR and (voulues is None or n in voulues)]
 
     res = {"maj": [], "absents_src": [], "absents_dst": [], "donnees": {},
-           "ids_src": list(idx_s),
+           "ids_src": list(idx_s), "videes": {},
            "col_absentes": sorted(voulues - (h_s.keys() & h_d.keys())) if voulues else [],
            "affichage": retirer_filtres(ws_d) if paires else None}
     for i in wanted:
@@ -227,7 +229,10 @@ def maj_lignes_excel(src: str, dst: str, ids, colonnes=None) -> dict:
         if rd is None:
             res["absents_dst"].append(i); continue
         for cs, cd in paires:
-            _copier_cellule(ws_s.cell(rs, cs), ws_d.cell(rd, cd))
+            c_s, c_d = ws_s.cell(rs, cs), ws_d.cell(rd, cd)
+            if c_s.value in (None, "") and c_d.value not in (None, ""):
+                res["videes"].setdefault(i, []).append(str(ws_d.cell(1, cd).value))
+            _copier_cellule(c_s, c_d)
         res["maj"].append(i)
 
     if res["maj"] or affichage_modifie(res["affichage"]):

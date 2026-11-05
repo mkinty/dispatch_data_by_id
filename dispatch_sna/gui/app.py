@@ -637,7 +637,8 @@ class App(tk.Tk):
             excel_txt = "Excel → non modifié (aucune colonne cochée)"
         else:
             apercu = ", ".join(colonnes[:6]) + (f" … (+{len(colonnes)-6})" if len(colonnes) > 6 else "")
-            excel_txt = f"Excel → lignes de ces ID, {len(colonnes)} colonne(s) : {apercu}"
+            excel_txt = (f"Excel → lignes de ces ID, {len(colonnes)} colonne(s) : {apercu} "
+                         "(une valeur vide dans Prod IA efface l'ancienne)")
         if colonnes == [] and ppt_mode is None:
             messagebox.showinfo("Rien à faire", "Aucune colonne Excel cochée et aucune option PPT : rien à mettre à jour."); return
         supp_txt = ("supprimés de Prod IA (s'ils ne contiennent pas d'autres ID)" if supprimer

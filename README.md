@@ -21,6 +21,9 @@ rempli + `cas_analyse_<ID>.pptx`) dans l'arborescence SharePoint
       Prod IA, sinon d'un `audit_<commune>.xlsx` SharePoint) ; bouton
       *🔍 Détecter* pour relancer. Le choix est sauvegardé dans
       `config_dispatcher.json` (`colonnes_maj`).
+    - Une colonne cochée remplace toujours l'ancienne valeur, **même si la valeur
+      de Prod IA est vide** : la cellule SharePoint est alors effacée, lien et
+      formule compris, et le journal le signale (🧽).
     - `ID erreur` n'est pas proposée : elle sert à retrouver les lignes.
     - Aucune colonne cochée → l'Excel n'est pas modifié (seuls les PPT le sont).
   - **PPT** (cases exclusives) :
@@ -28,7 +31,8 @@ rempli + `cas_analyse_<ID>.pptx`) dans l'arborescence SharePoint
     - *Modifier les PPT* : dans le PPT existant, la zone « Analyse » reçoit la
       colonne `Remarque` et la ligne « Lien Street View : » la colonne
       `Lien Street View` (hyperlien de la cellule prioritaire). Une valeur vide
-      laisse la zone inchangée. Si le PPT n'existe pas encore sur SharePoint,
+      vide la zone si la colonne est cochée, et la laisse inchangée sinon. Si le
+      PPT n'existe pas encore sur SharePoint,
       celui de Prod IA est copié ;
     - aucune case : Excel seul.
   - Le dossier Prod IA de la commune n'est supprimé que si tout a réussi **et**

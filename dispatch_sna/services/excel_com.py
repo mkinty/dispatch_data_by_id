@@ -179,7 +179,12 @@ def _ecrire(ws, cell, attendu, lien, fmt):
     if isinstance(attendu, str) and attendu.startswith("="):
         _put_en(cell, "Formula", attendu)
     elif attendu is None or attendu == "":
-        cell.ClearContents()
+        # ClearContents est refusé sur une partie de cellule fusionnée. Seule la 1re cellule
+        # porte la valeur : vider les suivantes effacerait celle d'une autre colonne.
+        if not cell.MergeCells:
+            cell.ClearContents()
+        elif cell.MergeArea.Cells(1, 1).Address == cell.Address:
+            cell.MergeArea.ClearContents()
     elif _serie(attendu) is not None:
         cell.Value2 = _serie(attendu)
     else:
@@ -220,6 +225,8 @@ def _conforme(cell, attendu, lien) -> bool:
             ok = str(lu).replace("\r\n", "\n") == str(attendu).replace("\r\n", "\n")
     if ok and lien and not (isinstance(attendu, str) and attendu.startswith("=")):
         ok = cell.Hyperlinks.Count > 0 and _lien_norm(cell.Hyperlinks(1).Address) == _lien_norm(lien)
+    elif ok and not lien:
+        ok = cell.Hyperlinks.Count == 0                # un ancien lien ne doit pas survivre
     return ok
 
 
@@ -391,7 +398,7 @@ class SessionExcel:
         voulues = None if colonnes is None else {str(c).strip() for c in colonnes} - {COL_ID_ERR}
         res = {"maj": [], "absents_src": lecture["absents_src"], "absents_dst": [],
                "donnees": lecture["donnees"], "ids_src": lecture["ids_src"], "col_absentes": [],
-               "bloque": None, "non_verifies": [], "ouverture": None, "affichage": None}
+               "bloque": None, "non_verifies": [], "ouverture": None, "affichage": None, "videes": {}}
         a_ecrire = {i: c for i, c in lecture["cellules"].items() if c}
         if not a_ecrire:
             if voulues:
@@ -444,6 +451,8 @@ class SessionExcel:
                         continue
                     attendu = formule_pour(cel.valeur, cel.coord, f"{get_column_letter(c)}{r}")
                     cell = ws.Cells(r, c)
+                    if attendu in (None, "") and cell.Formula != "":
+                        res["videes"].setdefault(i, []).append(nom)
                     try:
                         _ecrire(ws, cell, attendu, cel.lien, cel.format)
                     except Exception as e:

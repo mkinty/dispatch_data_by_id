@@ -15,6 +15,7 @@ _RUN = re.compile(r"<a:r>.*?</a:r>", re.S)
 _T = re.compile(r"(<a:t(?:\s[^>]*)?>)(.*?)(</a:t>)", re.S)
 _END_RPR = re.compile(r"<a:endParaRPr\b[^>]*?(?:/>|>.*?</a:endParaRPr>)", re.S)
 _HLINK = re.compile(r'<a:hlinkClick\b[^>]*\br:id="([^"]+)"')
+_HLINK_BLOC = re.compile(r"<a:hlinkClick\b[^>]*?(?:/>|>.*?</a:hlinkClick>)", re.S)
 
 # Libellés fixes du template : jamais la zone « Analyse »
 _LIBELLES = re.compile(r"^(analyses\s*:|lien street view|sna nombre|ipe nombre|type de probl"
@@ -81,7 +82,10 @@ def _remplir_analyse(sp: str, texte: str) -> str:
 
 def _remplir_lien(para: str, lien: str, rels: str) -> tuple[str, str]:
     """Réécrit « Lien Street View : <lien> ». Si un run porte déjà un
-    hyperlien, le libellé va dans le 1er run et l'URL dans ce run (cible mise à jour)."""
+    hyperlien, le libellé va dans le 1er run et l'URL dans ce run (cible mise à jour).
+    Lien vide : ne reste que le libellé, sans hyperlien vers l'ancienne adresse."""
+    if not lien:
+        para = _HLINK_BLOC.sub("", para)
     runs = list(_RUN.finditer(para))
     lien_run = next((r for r in runs[1:] if _HLINK.search(r.group(0))), None)
     if lien_run is None:
@@ -137,6 +141,9 @@ def _modifier_slide(xml: str, rels: str, analyse: str | None, lien: str | None):
             j = i_lien - 1
             if j >= 0 and not _est_libelle(textes[j]) and _TXBODY.search(shapes[j].group(0)):
                 cible = j
+        if cible is None:                          # zone vidée (template bp_app : le lien ne la suit pas)
+            cible = next((i for i, s in enumerate(shapes)
+                          if 'name="Rectangle 8"' in s.group(0) and _TXBODY.search(s.group(0))), None)
         if cible is not None:
             remplacements[cible] = _remplir_analyse(remplacements.get(cible, shapes[cible].group(0)), analyse)
             a_ok = True
