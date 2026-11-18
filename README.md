@@ -102,7 +102,16 @@ les co-éditeurs, de recalculer ou d'enregistrer, il refuse les commandes
 `Audit` uniquement, l'outil retire les critères de filtre (tableaux Excel
 compris) et réaffiche les lignes et colonnes masquées, côté Prod IA comme côté
 SharePoint. Les flèches de filtre restent en place. Le journal indique chaque
-retrait (🧹). Si aucune colonne n'est cochée, le fichier SharePoint n'est pas
+retrait (🧹). Sur un onglet **protégé** :
+- le filtre est retiré quand même (`AutoFilter.ShowAllData`, autorisé là où
+  `Worksheet.ShowAllData` échoue) ;
+- les lignes et colonnes masquées à la main restent masquées, et le journal le
+  signale (🔒). Cela n'a pas d'effet sur la recherche des ID ;
+- un lien cliquable ne peut pas être créé : l'adresse est écrite en texte (🔗) ;
+- une cellule verrouillée à mettre à jour donne une erreur claire. La
+  protection n'est jamais retirée par l'outil.
+
+Si aucune colonne n'est cochée, le fichier SharePoint n'est pas
 ouvert et ses filtres restent. L'onglet `Audit` est obligatoire : s'il manque,
 l'erreur le dit et aucun autre onglet n'est utilisé à sa place.
 

@@ -95,8 +95,11 @@ def _journal_affichage(a, fichier, log_fn):
         faits.append(f"colonnes réaffichées : {', '.join(a['colonnes'])}")
     if faits:
         log_fn(f"  🧹 {fichier} : {' · '.join(faits)}", LOG_INFO)
+    if a.get("protege"):
+        log_fn(f"    🔒 {fichier} : onglet protégé, laissé masqué : {', '.join(a['protege'])} "
+               "(sans effet sur la mise à jour ; ôtez la protection pour les réafficher)", LOG_INFO)
     for e in a.get("erreurs", []):
-        log_fn(f"    ⚠️ {fichier} : filtres non retirés ({e})", LOG_WARN)
+        log_fn(f"    ⚠️ {fichier} : affichage non rétabli ({e}) — sans effet sur la recherche des ID", LOG_WARN)
 
 
 def ranger_ids(root_sp, commune, dossier_src, ids, ppt_mode, supprimer, log_fn, phase_fn=None,
@@ -184,6 +187,9 @@ def ranger_ids(root_sp, commune, dossier_src, ids, ppt_mode, supprimer, log_fn, 
             quoi = "toutes colonnes" if colonnes is None else f"{len(colonnes)} colonne(s)"
             verif = ", valeurs vérifiées" if "non_verifies" in r else ""
             log_fn(f"  📊 {len(r['maj'])} ligne(s) mise(s) à jour ({quoi}{verif}) dans {dep}/{commune}/{nom_dst}", LOG_OK)
+        for i, cols in r.get("liens_refuses", {}).items():
+            log_fn(f"    🔗 {i} : onglet protégé, lien cliquable non créé (adresse écrite en texte) : {', '.join(cols)}",
+                   LOG_INFO)
         for i, cols in r.get("videes", {}).items():
             log_fn(f"    🧽 {i} : ancienne valeur effacée, vide dans Prod IA : {', '.join(cols)}", LOG_INFO)
         if r.get("non_verifies"):

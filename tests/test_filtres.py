@@ -201,6 +201,85 @@ class TestViaExcel:
             with pytest.raises(ExcelErreur, match="protégé"):
                 s.maj_lignes(src, dst, IDS, COLS)
 
+    @staticmethod
+    def _proteger(s, path, masquer_a_la_main=False, **protection):
+        """Fichier client typique : onglet protégé, colonnes de saisie (D:E) déverrouillées."""
+        wb = s.xl.Workbooks.Open(path); ws = wb.Worksheets("Audit")
+        ws.Range("D:E").Locked = False
+        if masquer_a_la_main:
+            ws.Rows(21).Hidden = True; ws.Columns("F").Hidden = True
+        ws.Protect(**protection)
+        wb.Save(); wb.Close(False)
+
+    @pytest.mark.parametrize("protection", [{"AllowFiltering": True}, {}, {"Password": "x"}])
+    def test_feuille_protegee_filtree_showalldata_ne_bloque_plus(self, tmp_path, protection):
+        """Avant : « La méthode ShowAllData de la classe Worksheet a échoué »."""
+        src, dst = classeur(tmp_path / "s.xlsx", "NOUV"), classeur(tmp_path / "d.xlsx", "vierge")
+        with SessionExcel() as s:
+            wb = s.xl.Workbooks.Open(dst); ws = wb.Worksheets("Audit")
+            ws.Range("D:E").Locked = False                 # AVANT le filtre : sinon seules les lignes visibles le sont
+            ws.Range("A1:F21").AutoFilter(2, "OK")
+            ws.Protect(**protection)
+            wb.Save(); wb.Close(False)
+            r = s.maj_lignes(src, dst, IDS, COLS)
+        a = r["affichage"]
+        assert a["erreurs"] == [] and a["filtres"] and a["protege"] == []
+        assert r["maj"] == IDS
+        ws = load_workbook(dst)["Audit"]
+        assert [ws.cell(n, 4).value for n in (3, 16, 21)] == ["NOUV"] * 3
+        assert not ws.auto_filter.filterColumn
+        assert not any(d.hidden for d in ws.row_dimensions.values())
+        assert ws.protection.sheet                                   # protection jamais retirée
+
+    def test_feuille_protegee_masquee_a_la_main_est_signalee_sans_erreur(self, tmp_path):
+        src, dst = classeur(tmp_path / "s.xlsx", "NOUV"), classeur(tmp_path / "d.xlsx", "vierge")
+        with SessionExcel() as s:
+            self._proteger(s, dst, masquer_a_la_main=True, AllowFiltering=True)
+            r = s.maj_lignes(src, dst, IDS, COLS)
+        a = r["affichage"]
+        assert a["erreurs"] == [] and a["protege"] == ["colonne Date Analyse", "lignes masquées"]
+        assert r["maj"] == IDS                                      # 74143_20 (ligne 21 masquée) compris
+        assert load_workbook(dst)["Audit"]["D21"].value == "NOUV"
+
+    def test_feuille_protegee_lien_refuse_valeur_ecrite(self, tmp_path):
+        src, dst = classeur(tmp_path / "s.xlsx", "NOUV"), classeur(tmp_path / "d.xlsx", "vierge")
+        wb = load_workbook(src); wb["Audit"]["E16"].hyperlink = "https://sv/NOUV/15"; wb.save(src)
+        with SessionExcel() as s:
+            self._proteger(s, dst)
+            r = s.maj_lignes(src, dst, ["74143_15"], COLS)
+        assert r["maj"] == ["74143_15"] and r["non_verifies"] == []
+        assert r["liens_refuses"] == {"74143_15": ["Lien Street View"]}
+        ws = load_workbook(dst)["Audit"]
+        assert ws["D16"].value == "NOUV" and ws["E16"].value == "https://sv/NOUV/15"
+
+    def test_aucun_excel_orphelin_apres_une_exception(self):
+        import pythoncom, win32api, win32con, win32event
+        with pytest.raises(RuntimeError):
+            with SessionExcel() as s:
+                pid = s._pid
+                wb = s.xl.Workbooks.Add()                # référence gardée par la trace de l'exception
+                raise RuntimeError("plantage simulé")
+        assert pid
+        try:
+            h = win32api.OpenProcess(win32con.SYNCHRONIZE, False, pid)
+        except Exception:
+            return                                       # processus déjà terminé
+        try:
+            assert win32event.WaitForSingleObject(h, 0) == win32event.WAIT_OBJECT_0
+        finally:
+            win32api.CloseHandle(h)
+
+    def test_filtre_avance(self, tmp_path):
+        src, dst = classeur(tmp_path / "s.xlsx", "NOUV"), classeur(tmp_path / "d.xlsx", "vierge")
+        with SessionExcel() as s:
+            wb = s.xl.Workbooks.Open(dst); ws = wb.Worksheets("Audit")
+            ws.Range("H1:H2").Value = (("Etat",), ("OK",))
+            ws.Range("A1:F21").AdvancedFilter(1, ws.Range("H1:H2"))
+            wb.Save(); wb.Close(False)
+            r = s.maj_lignes(src, dst, IDS, COLS)
+        assert r["affichage"]["filtres"] and r["affichage"]["erreurs"] == [] and r["maj"] == IDS
+        assert not any(d.hidden for d in load_workbook(dst)["Audit"].row_dimensions.values())
+
     def test_ligne_masquee_a_la_main_sans_filtre(self, tmp_path):
         src, dst = classeur(tmp_path / "s.xlsx", "NOUV"), classeur(tmp_path / "d.xlsx", "vierge")
         with SessionExcel() as s:

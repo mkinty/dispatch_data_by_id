@@ -25,7 +25,6 @@ from .onedrive import url_sharepoint
 
 _EN = 1033                 # propriétés NumberFormat / Formula toujours en anglais (sinon « General » est refusé en français)
 _XL_CALC_MANUEL = -4135
-_XL_CELLULES_VISIBLES = 12
 _EPOQUE = _dt.datetime(1899, 12, 30)
 
 
@@ -175,7 +174,10 @@ def _lien_norm(u) -> str:
 
 
 # ── écriture / vérification d'une cellule ─────────────────────────
-def _ecrire(ws, cell, attendu, lien, fmt):
+def _ecrire(ws, cell, attendu, lien, fmt) -> bool:
+    """Écrit valeur / formule, format et lien. Retourne False si le lien cliquable n'a pas pu
+    être créé parce que l'onglet est protégé (Excel y interdit l'insertion de liens, même dans
+    une cellule déverrouillée) : la valeur est alors écrite, le lien manque."""
     if isinstance(attendu, str) and attendu.startswith("="):
         _put_en(cell, "Formula", attendu)
     elif attendu is None or attendu == "":
@@ -200,12 +202,20 @@ def _ecrire(ws, cell, attendu, lien, fmt):
     if lien and not (isinstance(attendu, str) and attendu.startswith("=")):
         if cell.Hyperlinks.Count:
             cell.Hyperlinks.Delete()
-        if isinstance(attendu, str) and attendu:
-            ws.Hyperlinks.Add(cell, lien, "", "", attendu)
-        else:
-            ws.Hyperlinks.Add(cell, lien)      # garde la valeur de la cellule (affiche le lien si vide)
+        try:
+            if isinstance(attendu, str) and attendu:
+                ws.Hyperlinks.Add(cell, lien, "", "", attendu)
+            else:
+                ws.Hyperlinks.Add(cell, lien)  # garde la valeur de la cellule (affiche le lien si vide)
+        except Exception as e:
+            if _est_rejet(e) or not ws.ProtectContents:
+                raise
+            if attendu in (None, ""):
+                cell.Value2 = lien             # au moins l'adresse, en texte
+            return False
     elif not lien and cell.Hyperlinks.Count:
         cell.Hyperlinks.Delete()
+    return True
 
 
 def _conforme(cell, attendu, lien) -> bool:
@@ -230,6 +240,31 @@ def _conforme(cell, attendu, lien) -> bool:
     return ok
 
 
+# ── processus Excel ───────────────────────────────────────────────
+def _pid_de(xl):
+    """PID de l'instance Excel pilotée (via la fenêtre principale)."""
+    try:
+        import win32process
+        return win32process.GetWindowThreadProcessId(xl.Hwnd)[1] or None
+    except Exception:
+        return None
+
+
+def _terminer_si_toujours_ouvert(pid, attente_s=15):
+    if not pid:
+        return
+    try:
+        import win32api, win32con, win32event
+        h = win32api.OpenProcess(win32con.SYNCHRONIZE | win32con.PROCESS_TERMINATE, False, pid)
+    except Exception:
+        return                                         # déjà fermé
+    try:
+        if win32event.WaitForSingleObject(h, int(attente_s * 1000)) == win32event.WAIT_TIMEOUT:
+            win32api.TerminateProcess(h, 1)
+    finally:
+        win32api.CloseHandle(h)
+
+
 # ── session ───────────────────────────────────────────────────────
 class SessionExcel:
     """Une instance Excel dédiée (jamais celle de l'utilisateur), fermée à la sortie.
@@ -245,6 +280,7 @@ class SessionExcel:
         self.delai_occupe_s = delai_occupe_s
         self.xl = None
         self._filtre = None
+        self._pid = None
 
     def __enter__(self):
         try:
@@ -258,6 +294,7 @@ class SessionExcel:
         self._filtre.installer()
         try:
             self.xl = wc.DispatchEx("Excel.Application")   # nouvelle instance, n'interfère pas avec l'Excel ouvert
+            self._pid = _pid_de(self.xl)
             self.xl.Visible = bool(self.visible)
             self.xl.DisplayAlerts = False
             self.xl.AskToUpdateLinks = False
@@ -280,6 +317,11 @@ class SessionExcel:
         if self._filtre is not None:
             self._filtre.retirer(); self._filtre = None
         _pythoncom().CoUninitialize()
+        # Si une référence COM traîne encore (exception en cours, objet gardé ailleurs), Excel
+        # ne se ferme pas et reste invisible en verrouillant les fichiers : on termine CETTE
+        # instance-là, identifiée par son PID au démarrage — jamais l'Excel de l'utilisateur.
+        _terminer_si_toujours_ouvert(self._pid, attente_s=15)
+        self._pid = None
         return False
 
     def _attendre_pret(self):
@@ -332,9 +374,21 @@ class SessionExcel:
     @staticmethod
     def _retirer_filtres(ws) -> dict:
         """Retire les filtres et réaffiche lignes et colonnes masquées de l'onglet.
-        Les flèches de filtre restent en place. Une feuille protégée n'est pas bloquante
-        ici : l'erreur est rapportée et la recherche des ID reste juste (cf. UsedRange)."""
-        res = {"filtres": False, "lignes": False, "colonnes": [], "erreurs": []}
+        Les flèches de filtre restent en place.
+
+        Ordre des commandes, de la plus tolérante à la plus stricte :
+        Worksheet.ShowAllData échoue sur une feuille protégée (« La méthode ShowAllData de
+        la classe Worksheet a échoué »), même si le filtrage y est autorisé, alors que
+        AutoFilter.ShowAllData réussit. Elle ne sert donc qu'en dernier recours (filtre avancé).
+        Sur une feuille protégée, une ligne ou colonne masquée À LA MAIN ne peut pas être
+        réaffichée : c'est signalé (« protege »), sans effet sur la mise à jour, qui lit
+        toute la zone utilisée. La protection n'est jamais retirée.
+        Retourne {"filtres", "lignes", "colonnes", "protege": [ce qui reste masqué], "erreurs"}."""
+        res = {"filtres": False, "lignes": False, "colonnes": [], "protege": [], "erreurs": []}
+        protegee = bool(ws.ProtectContents)
+
+        def message(e):
+            return str(getattr(e, "excepinfo", None) and e.excepinfo[2] or e)
 
         def essai(action):
             try:
@@ -342,36 +396,49 @@ class SessionExcel:
             except Exception as e:
                 if _est_rejet(e):
                     raise
-                res["erreurs"].append(str(getattr(e, "excepinfo", None) and e.excepinfo[2] or e))
+                res["erreurs"].append(message(e))
 
         def filtres():
-            if ws.FilterMode:
-                ws.ShowAllData(); res["filtres"] = True
+            af = ws.AutoFilter if ws.AutoFilterMode else None
+            if af is not None and af.FilterMode:
+                af.ShowAllData(); res["filtres"] = True
             for i in range(1, ws.ListObjects.Count + 1):      # tableaux Excel : filtre propre à chacun
                 af = ws.ListObjects(i).AutoFilter
                 if af is not None and af.FilterMode:
                     af.ShowAllData(); res["filtres"] = True
+            if ws.FilterMode:                                 # reste : filtre avancé (Données > Avancé)
+                try:
+                    ws.ShowAllData(); res["filtres"] = True
+                except Exception as e:
+                    if _est_rejet(e):
+                        raise
+                    if not protegee:
+                        raise
+                    res["protege"].append("filtre avancé")
 
         # Range.Hidden vaut False sur une plage partiellement masquée : il ne dit rien ici.
         def colonnes():
             ur = ws.UsedRange
             for c in range(ur.Column, ur.Column + ur.Columns.Count):
-                if ws.Columns(c).Hidden:
-                    ws.Columns(c).Hidden = False
-                    res["colonnes"].append(str(ws.Cells(1, c).Value or get_column_letter(c)))
+                if not ws.Columns(c).Hidden:
+                    continue
+                nom = str(ws.Cells(1, c).Value or get_column_letter(c))
+                if protegee:
+                    res["protege"].append(f"colonne {nom}"); continue
+                ws.Columns(c).Hidden = False
+                res["colonnes"].append(nom)
 
         def lignes():
-            ur = ws.UsedRange
-            try:
-                visibles = ur.Columns(1).SpecialCells(_XL_CELLULES_VISIBLES).Count
-            except Exception as e:
-                if _est_rejet(e):
-                    raise
-                visibles = 0                                  # aucune cellule visible
-            if visibles < ur.Rows.Count:
-                ur.EntireRow.Hidden = False; res["lignes"] = True
+            # SUBTOTAL(103) = cellules remplies VISIBLES ; COUNTA = toutes. Contrairement à
+            # SpecialCells, ce calcul est autorisé sur une feuille protégée.
+            ur, wf = ws.UsedRange, ws.Application.WorksheetFunction
+            if wf.Subtotal(103, ur) >= wf.CountA(ur):
+                return
+            if protegee:
+                res["protege"].append("lignes masquées"); return
+            ur.EntireRow.Hidden = False; res["lignes"] = True
 
-        for action in (filtres, colonnes, lignes):            # colonnes avant lignes : le comptage lit la 1re colonne
+        for action in (filtres, colonnes, lignes):
             essai(action)
         return res
 
@@ -402,7 +469,7 @@ class SessionExcel:
         res = {"maj": [], "absents_src": lecture["absents_src"], "absents_dst": [],
                "donnees": lecture["donnees"], "ids_src": lecture["ids_src"], "col_absentes": [],
                "bloque": None, "non_verifies": [], "ouverture": None, "affichage": None, "videes": {},
-               "onglets": {"src": lecture["onglet"], "dst": None}}
+               "onglets": {"src": lecture["onglet"], "dst": None}, "liens_refuses": {}}
         a_ecrire = {i: c for i, c in lecture["cellules"].items() if c}
         if not a_ecrire:
             if voulues:
@@ -459,13 +526,16 @@ class SessionExcel:
                     if attendu in (None, "") and cell.Formula != "":
                         res["videes"].setdefault(i, []).append(nom)
                     try:
-                        _ecrire(ws, cell, attendu, cel.lien, cel.format)
+                        lien_ok = _ecrire(ws, cell, attendu, cel.lien, cel.format)
                     except Exception as e:
                         if not _est_rejet(e) and ws.ProtectContents:
-                            raise ExcelErreur(f"onglet « {ONGLET_AUDIT} » protégé : ôtez la protection "
-                                              "de la feuille puis rejouez") from e
+                            raise ExcelErreur(f"onglet « {ONGLET_AUDIT} » protégé et cellule {nom} verrouillée : "
+                                              "ôtez la protection de la feuille puis rejouez") from e
                         raise
-                    faits.append((cell, attendu, cel.lien))
+                    if not lien_ok:
+                        res["liens_refuses"].setdefault(i, []).append(nom)
+                    faits.append((cell, attendu if lien_ok or attendu not in (None, "") else cel.lien,
+                                  cel.lien if lien_ok else None))
                 if faits:
                     ecrits[i] = faits
             self.xl.Calculation = calcul; calcul = None   # le fichier est enregistré avec son mode de calcul d'origine
