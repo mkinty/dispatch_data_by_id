@@ -46,11 +46,42 @@ def verifier_nettoye(path, remarque):
 
 
 # ── Onglet ────────────────────────────────────────────────────────
-def test_onglet_audit_introuvable_est_une_erreur(tmp_path):
-    wb = Workbook(); wb.active.title = "DGFIP"; wb.active["A1"] = "ID erreur"
+def test_sans_onglet_audit_la_1re_feuille_est_utilisee(tmp_path):
+    wb = Workbook(); wb.active.title = "Feuil1"; wb.active.append(ENT)
+    wb.create_sheet("DGFIP")["A1"] = "autre"
+    wb.active = wb["DGFIP"]                                      # l'onglet actif n'est pas la 1re feuille
     wb.save(tmp_path / "a.xlsx")
-    with pytest.raises(ExcelErreur, match="Audit.*DGFIP"):
+    assert lire_entetes(str(tmp_path / "a.xlsx")) == ENT
+
+
+def test_sans_onglet_audit_ni_id_erreur_en_1re_feuille_est_une_erreur(tmp_path):
+    wb = Workbook(); wb.active.title = "Feuil1"; wb.active["A1"] = "Adresse"
+    wb.create_sheet("DGFIP")["A1"] = "ID erreur"                 # « ID erreur » ailleurs : ignoré
+    wb.save(tmp_path / "a.xlsx")
+    with pytest.raises(ExcelErreur, match="Audit.*1re feuille « Feuil1 »"):
         lire_entetes(str(tmp_path / "a.xlsx"))
+
+
+def test_onglet_audit_prioritaire_sur_la_1re_feuille(tmp_path):
+    wb = Workbook(); wb.active.title = "Feuil1"; wb.active.append(["ID erreur", "Feuil1"])
+    wb.create_sheet("Audit").append(ENT)
+    wb.save(tmp_path / "a.xlsx")
+    assert lire_entetes(str(tmp_path / "a.xlsx")) == ENT
+
+
+def test_ranger_ids_prod_ia_sans_onglet_audit(tmp_path):
+    root = tmp_path / "sp"; d = root / "Dep74" / "74143"; d.mkdir(parents=True)
+    src_dir = tmp_path / "prod" / "74143"; src_dir.mkdir(parents=True)
+    wb = Workbook(); wb.active.title = "Feuil1"; wb.active.append(ENT)
+    wb.active.append(["74143_2", "OK", "adr", "NOUV", "https://sv/2", None])
+    wb.save(src_dir / "audit_74143.xlsx")
+    dst = classeur(d / "audit_74143.xlsx", "vierge")
+    lignes = []
+    st = ranger_ids(str(root), "74143", str(src_dir), ["74143_2"], None, False,
+                    lambda m, c=None: lignes.append(m), colonnes=COLS)
+    assert st["lignes"] == 1 and st["echecs"] == {}
+    assert load_workbook(dst)["Audit"]["D3"].value == "NOUV"
+    assert any("1re feuille « Feuil1 » utilisée" in l and "Prod IA" in l for l in lignes)
 
 
 def test_le_bon_onglet_est_lu_meme_si_un_autre_est_actif(tmp_path):
@@ -180,9 +211,19 @@ class TestViaExcel:
         assert r["maj"] == IDS and r["affichage"]["lignes"] and not r["affichage"]["filtres"]
         assert not any(d.hidden for d in load_workbook(dst)["Audit"].row_dimensions.values())
 
-    def test_onglet_audit_absent(self, tmp_path):
+    def test_onglet_audit_absent_1re_feuille_utilisee(self, tmp_path):
         src = classeur(tmp_path / "s.xlsx", "NOUV")
-        wb = Workbook(); wb.active.title = "DGFIP"; wb.active.append(ENT); wb.save(tmp_path / "d.xlsx")
+        dst = classeur(tmp_path / "d.xlsx", "vierge")
+        wb = load_workbook(dst); wb["Audit"].title = "Feuil1"; wb.active = wb["DGFIP"]; wb.save(dst)
         with SessionExcel() as s:
-            with pytest.raises(ExcelErreur, match="Audit"):
+            r = s.maj_lignes(src, dst, IDS, COLS)
+        assert r["maj"] == IDS and r["onglets"] == {"src": "Audit", "dst": "Feuil1"}
+        assert load_workbook(dst)["Feuil1"]["D3"].value == "NOUV"
+
+    def test_onglet_audit_absent_et_1re_feuille_sans_id(self, tmp_path):
+        src = classeur(tmp_path / "s.xlsx", "NOUV")
+        wb = Workbook(); wb.active.title = "Feuil1"; wb.active["A1"] = "Adresse"
+        wb.create_sheet("DGFIP").append(ENT); wb.save(tmp_path / "d.xlsx")
+        with SessionExcel() as s:
+            with pytest.raises(ExcelErreur, match="1re feuille « Feuil1 »"):
                 s.maj_lignes(src, str(tmp_path / "d.xlsx"), IDS, COLS)

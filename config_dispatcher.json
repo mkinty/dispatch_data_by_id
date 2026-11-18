@@ -6,5 +6,8 @@
   "mode": "ids",
   "ppt_remplacer": false,
   "ppt_modifier": true,
-  "colonnes_maj": []
+  "colonnes_maj": [],
+  "excel_com": true,
+  "excel_visible": false,
+  "excel_delai_occupe_s": 120
 }

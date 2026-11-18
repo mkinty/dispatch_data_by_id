@@ -16,14 +16,62 @@ def _norm(v) -> str:
     return str(v).strip().upper() if v is not None else ""
 
 
+class ExcelErreur(Exception):
+    """Structure inattendue (colonne ID erreur absente...)."""
+
+
+class OngletIntrouvable(ExcelErreur):
+    """Aucun onglet au nom d'« Audit » (≠ plusieurs candidats, qui reste une ExcelErreur)."""
+
+
+def _cle_onglet(nom) -> str:
+    return "".join(str(nom).split()).replace("_", "").replace("-", "").casefold()
+
+
+def choisir_onglet(noms, nom=ONGLET_AUDIT) -> str:
+    """Nom de l'onglet Audit parmi `noms` : « Audit » (espaces / casse ignorés), sinon
+    l'UNIQUE onglet dont le nom contient « audit » (« Audit SNA », « Audit_38068 »…).
+    Jamais l'onglet actif : il dépend du dernier enregistrement (DGFIP, IPE…).
+    Lève ExcelErreur si aucun ou plusieurs onglets possibles."""
+    cible = _cle_onglet(nom)
+    noms = [str(n) for n in noms]
+    exacts = [n for n in noms if _cle_onglet(n) == cible]
+    if exacts:
+        return exacts[0]
+    proches = [n for n in noms if cible in _cle_onglet(n)]
+    if len(proches) == 1:
+        return proches[0]
+    if proches:
+        raise ExcelErreur(f"plusieurs onglets possibles pour « {nom} » : {', '.join(proches)}")
+    raise OngletIntrouvable(f"onglet « {nom} » introuvable (onglets présents : {', '.join(noms)})")
+
+
+def est_onglet_audit(nom, cible=ONGLET_AUDIT) -> bool:
+    return _cle_onglet(cible) in _cle_onglet(nom)
+
+
+def repli_premiere_feuille(erreur, titre, entetes):
+    """Sans onglet Audit, la 1re feuille sert d'onglet Audit si sa ligne 1 contient
+    « ID erreur » (sinon ce n'est pas un fichier audit : on refuse plutôt que d'écrire ailleurs)."""
+    if COL_ID_ERR in entetes:
+        return
+    raise OngletIntrouvable(f"{erreur} ; la 1re feuille « {titre} » n'a pas non plus "
+                            f"de colonne « {COL_ID_ERR} » en ligne 1") from None
+
+
+def _ligne1(ws) -> list[str]:
+    ligne = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ())
+    return [str(v).strip() for v in ligne if v is not None and str(v).strip()]
+
+
 def trouver_onglet(wb, nom=ONGLET_AUDIT):
-    """Onglet « Audit » (espaces/casse ignorés). Jamais de repli sur un autre onglet :
-    l'onglet actif dépend du dernier enregistrement et pourrait être DGFIP, IPE, etc."""
-    cible = "".join(nom.split()).casefold()
-    for titre in wb.sheetnames:
-        if "".join(titre.split()).casefold() == cible:
-            return wb[titre]
-    raise ExcelErreur(f"onglet « {nom} » introuvable (onglets présents : {', '.join(wb.sheetnames)})")
+    """Onglet « Audit » (cf. choisir_onglet) ; à défaut la 1re feuille, si elle a « ID erreur »."""
+    try:
+        return wb[choisir_onglet(wb.sheetnames, nom)]
+    except OngletIntrouvable as e:
+        premiere = wb.worksheets[0]
+        repli_premiere_feuille(e, premiere.title, _ligne1(premiere))
+        return premiere
 
 
 def retirer_filtres(ws) -> dict:
@@ -142,8 +190,6 @@ def lire_lignes(chemin: str, ids) -> dict[str, dict[str, str]]:
     return res
 
 
-class ExcelErreur(Exception):
-    """Structure inattendue (colonne ID erreur absente...)."""
 
 
 @dataclass
@@ -170,7 +216,8 @@ def lire_cellules(src: str, ids, colonnes=None) -> dict:
     idx = _index_ids(ws, h[COL_ID_ERR])
     voulues = None if colonnes is None else {str(c).strip() for c in colonnes} - {COL_ID_ERR}
     noms = [n for n in h if n != COL_ID_ERR and (voulues is None or n in voulues)]
-    res = {"entetes": list(h), "cellules": {}, "donnees": {}, "ids_src": list(idx), "absents_src": []}
+    res = {"entetes": list(h), "cellules": {}, "donnees": {}, "ids_src": list(idx), "absents_src": [],
+           "onglet": ws.title}
     for i in wanted:
         r = idx.get(i)
         if r is None:
@@ -215,6 +262,7 @@ def maj_lignes_excel(src: str, dst: str, ids, colonnes=None) -> dict:
 
     res = {"maj": [], "absents_src": [], "absents_dst": [], "donnees": {},
            "ids_src": list(idx_s), "videes": {},
+           "onglets": {"src": ws_s.title, "dst": ws_d.title},
            "col_absentes": sorted(voulues - (h_s.keys() & h_d.keys())) if voulues else [],
            "affichage": retirer_filtres(ws_d) if paires else None}
     for i in wanted:

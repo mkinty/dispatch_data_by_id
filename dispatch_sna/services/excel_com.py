@@ -20,7 +20,7 @@ from urllib.parse import unquote
 from openpyxl.utils import get_column_letter
 
 from .constantes import ONGLET_AUDIT, COL_ID_ERR
-from .excel_rows import ExcelErreur, affichage_modifie, lire_cellules, formule_pour, _norm
+from .excel_rows import ExcelErreur, OngletIntrouvable, affichage_modifie, choisir_onglet, repli_premiere_feuille, lire_cellules, formule_pour, _norm
 from .onedrive import url_sharepoint
 
 _EN = 1033                 # propriétés NumberFormat / Formula toujours en anglais (sinon « General » est refusé en français)
@@ -316,15 +316,18 @@ class SessionExcel:
 
     @staticmethod
     def _onglet(wb):
-        """Onglet « Audit » uniquement : jamais de repli sur l'onglet actif."""
-        cible = "".join(ONGLET_AUDIT.split()).casefold()
-        noms = []
-        for i in range(1, wb.Worksheets.Count + 1):
-            ws = wb.Worksheets(i)
-            noms.append(str(ws.Name))
-            if "".join(noms[-1].split()).casefold() == cible:
-                return ws
-        raise ExcelErreur(f"onglet « {ONGLET_AUDIT} » introuvable (onglets présents : {', '.join(noms)})")
+        """Onglet « Audit », à défaut la 1re feuille si elle a « ID erreur » (même règle que la lecture)."""
+        noms = [str(wb.Worksheets(i).Name) for i in range(1, wb.Worksheets.Count + 1)]
+        try:
+            return wb.Worksheets(choisir_onglet(noms, ONGLET_AUDIT))
+        except OngletIntrouvable as e:
+            ws = wb.Worksheets(1)
+            utile = ws.UsedRange
+            der_col = utile.Column + utile.Columns.Count - 1
+            entetes = [str(v).strip() for v in _plat(ws.Range(ws.Cells(1, 1), ws.Cells(1, der_col)).Value)
+                       if v is not None]
+            repli_premiere_feuille(e, ws.Name, entetes)
+            return ws
 
     @staticmethod
     def _retirer_filtres(ws) -> dict:
@@ -398,7 +401,8 @@ class SessionExcel:
         voulues = None if colonnes is None else {str(c).strip() for c in colonnes} - {COL_ID_ERR}
         res = {"maj": [], "absents_src": lecture["absents_src"], "absents_dst": [],
                "donnees": lecture["donnees"], "ids_src": lecture["ids_src"], "col_absentes": [],
-               "bloque": None, "non_verifies": [], "ouverture": None, "affichage": None, "videes": {}}
+               "bloque": None, "non_verifies": [], "ouverture": None, "affichage": None, "videes": {},
+               "onglets": {"src": lecture["onglet"], "dst": None}}
         a_ecrire = {i: c for i, c in lecture["cellules"].items() if c}
         if not a_ecrire:
             if voulues:
@@ -415,6 +419,7 @@ class SessionExcel:
                 res["bloque"] = qui or "un autre utilisateur"
                 return res
             ws = self._onglet(wb)
+            res["onglets"]["dst"] = str(ws.Name)
             res["affichage"] = self._retirer_filtres(ws)
             # UsedRange et non End(xlUp/xlToLeft) : End s'arrête à la dernière ligne / colonne
             # VISIBLE, les ID filtrés passeraient pour absents et les colonnes masquées aussi.

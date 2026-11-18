@@ -17,6 +17,7 @@ from ..services.chemins import get_dep, lister_communes_prod, detecter_colonnes,
 from ..services.constantes import COL_ID_ERR
 from ..services.dispatcher import ranger_commune, ranger_ids
 from ..services.error_ids import extraire_ids
+from ..services.excel_rows import lire_entetes
 from ..services.excel_com import SessionExcel, ExcelIndisponible, excel_disponible
 from .theme import (C_ACCENT, C_AMBER, C_BG, C_BORDER, C_BORDER2, C_CARD, C_CYAN, C_GREEN, C_MUTED,
                     C_PANEL, C_PANEL2, C_PURPLE, C_RED, C_TEXT, C_TEXT2, F_BODY, F_MONO, F_TITLE)
@@ -182,8 +183,8 @@ class App(tk.Tk):
         colh = tk.Frame(self.frm_ids, bg=C_CARD); colh.pack(fill="x", pady=(10,0))
         tk.Label(colh, text="Colonnes Excel à mettre à jour :", bg=C_CARD, fg=C_MUTED,
                  font=(F_BODY,9,"bold")).pack(side="left")
-        for txt, cmd in [("🔍 Détecter", self._detect_cols), ("☑ Toutes", lambda: self._cocher_cols(True)),
-                         ("☐ Aucune", lambda: self._cocher_cols(False))]:
+        for txt, cmd in [("📂 Choisir un fichier…", self._choisir_fichier_cols), ("🔍 Détecter", self._detect_cols),
+                         ("☑ Toutes", lambda: self._cocher_cols(True)), ("☐ Aucune", lambda: self._cocher_cols(False))]:
             tk.Button(colh, text=txt, command=cmd, bg=C_PANEL2, fg=C_TEXT2, font=(F_BODY,8), relief="flat",
                       cursor="hand2", padx=10, pady=2).pack(side="right", padx=(6,0))
         self.frm_cols = tk.Frame(self.frm_ids, bg=C_CARD); self.frm_cols.pack(fill="x", pady=(4,0))
@@ -337,13 +338,29 @@ class App(tk.Tk):
             if "r" not in res: self.after(200, attendre); return
             self._afficher_cols(*res["r"])
         self.after(200, attendre)
-    def _afficher_cols(self, cols, fichier):
+    def _choisir_fichier_cols(self):
+        """Repli manuel : lire les colonnes d'un Excel audit choisi par l'utilisateur."""
+        f = filedialog.askopenfilename(title="Excel audit dont lire les colonnes",
+                                       initialdir=self.ent_prod_ia.get().strip() or None,
+                                       filetypes=[("Excel", "*.xlsx")])
+        if not f: return
+        try:
+            cols = lire_entetes(f)
+        except Exception as e:
+            return self._afficher_cols([], None, [f"✗ {os.path.basename(f)} : {e}"])
+        if COL_ID_ERR not in cols:
+            return self._afficher_cols([], None, [f"✗ {os.path.basename(f)} : pas de colonne « {COL_ID_ERR} » "
+                                                  "en ligne 1 de l'onglet Audit"])
+        self._afficher_cols(cols, f, [])
+    def _afficher_cols(self, cols, fichier, rapport=()):
         for w in self.frm_cols.winfo_children(): w.destroy()
         self._col_vars = {}
         cols = [c for c in cols if c != COL_ID_ERR]   # clé de correspondance, jamais modifiée
         if not cols:
-            self.lbl_cols.config(fg=C_AMBER, text="  ⚠️ Aucun Excel trouvé dans Prod IA ni SharePoint — vérifiez "
-                                 "les chemins puis 🔍 Détecter. Sans détection, toutes les colonnes sont mises à jour.")
+            self.lbl_cols.config(fg=C_AMBER, text="  ⚠️ Colonnes non détectées :\n    "
+                                 + "\n    ".join(rapport or ["aucun fichier lisible"])
+                                 + "\n  → vérifiez les chemins puis 🔍 Détecter, ou 📂 Choisir un fichier…"
+                                   " (mise à jour Excel impossible tant que les colonnes ne sont pas connues)")
             return
         self._cols_src = fichier
         saved = self.cfg.get("colonnes_maj")
@@ -369,7 +386,7 @@ class App(tk.Tk):
                    "« Remarque » et « Lien Street View » de Prod IA)")
         self._save_cfg()
     def _colonnes_maj(self):
-        """Colonnes cochées, ou None si la détection n'a rien trouvé (= toutes)."""
+        """Colonnes cochées, ou None si les colonnes ne sont pas connues (le lancement est alors refusé)."""
         if not self._col_vars: return None
         return [c for c, v in self._col_vars.items() if v.get()]
 
@@ -632,8 +649,14 @@ class App(tk.Tk):
                    None:        "PPT → non traités"}[ppt_mode]
         colonnes = self._colonnes_maj()
         if colonnes is None:
-            excel_txt = "Excel → lignes de ces ID, toutes les colonnes (colonnes non détectées)"
-        elif not colonnes:
+            # Jamais « toutes les colonnes » à l'aveugle : une valeur vide efface l'ancienne
+            messagebox.showwarning("Colonnes non détectées",
+                "Les colonnes Excel n'ont pas pu être détectées : rien n'est lancé, pour ne pas "
+                "écraser des colonnes que vous n'auriez pas choisies.\n\n"
+                "Dans « Colonnes Excel à mettre à jour », cliquez sur 🔍 Détecter (la raison s'affiche "
+                "sous les boutons) ou sur 📂 Choisir un fichier… pour indiquer un Excel audit.")
+            return
+        if not colonnes:
             excel_txt = "Excel → non modifié (aucune colonne cochée)"
         else:
             apercu = ", ".join(colonnes[:6]) + (f" … (+{len(colonnes)-6})" if len(colonnes) > 6 else "")

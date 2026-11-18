@@ -7,7 +7,7 @@ from .constantes import (AUDIT_PREFIX, PPT_FOLDER, COL_REMARQUE, COL_LIEN_SV,
                          LOG_OK, LOG_INFO, LOG_WARN, LOG_ERR)
 from .chemins import get_dep, onedrive_pin, copier_remplacer
 from .error_ids import nom_ppt
-from .excel_rows import maj_lignes_excel, lire_lignes, retirer_filtres_fichier
+from .excel_rows import est_onglet_audit, maj_lignes_excel, lire_lignes, retirer_filtres_fichier
 from .ppt_editor import modifier_ppt, copier_ppt
 
 
@@ -160,6 +160,11 @@ def ranger_ids(root_sp, commune, dossier_src, ids, ppt_mode, supprimer, log_fn, 
         log_fn(f"    ⚠️ Filtres de {nom_src} (Prod IA) non retirés : {e}", LOG_WARN)
     try:
         r = maj_excel(excel_src, excel_dst, ids, colonnes)
+        for cote, fichier in (("src", f"Prod IA/{commune}/{nom_src}"), ("dst", f"{dep}/{commune}/{nom_dst}")):
+            onglet = (r.get("onglets") or {}).get(cote)
+            if onglet and not est_onglet_audit(onglet):
+                log_fn(f"  📄 {fichier} : pas d'onglet Audit → 1re feuille « {onglet} » utilisée "
+                       f"(elle contient la colonne « ID erreur »)", LOG_INFO)
         _journal_affichage(r.get("affichage"), f"{dep}/{commune}/{nom_dst}", log_fn)
         donnees, ids_src = r["donnees"], r["ids_src"]
         stats["lignes"] = len(r["maj"]); stats["excel"] = 1 if r["maj"] else 0

@@ -25,6 +25,19 @@ rempli + `cas_analyse_<ID>.pptx`) dans l'arborescence SharePoint
       de Prod IA est vide** : la cellule SharePoint est alors effacée, lien et
       formule compris, et le journal le signale (🧽).
     - `ID erreur` n'est pas proposée : elle sert à retrouver les lignes.
+    - Détection : Prod IA jusqu'à 3 niveaux de sous-dossiers (`À déposer/LOTxx/<commune>/`
+      compris), puis `DepXX/<commune>/audit_*.xlsx`. Jusqu'à 12 fichiers sont essayés,
+      ceux déjà présents sur le disque d'abord. Un fichier n'est retenu que si son onglet
+      Audit contient « ID erreur ». En cas d'échec, la raison s'affiche pour chaque
+      fichier écarté, et *📂 Choisir un fichier…* permet d'indiquer un Excel à la main.
+    - Tant que les colonnes ne sont pas connues, la mise à jour par ID refuse de se
+      lancer : jamais « toutes les colonnes » à l'aveugle.
+    - Onglet Audit, pour la lecture comme pour l'écriture :
+      1. l'onglet nommé « Audit » (casse et espaces ignorés), sinon l'unique onglet
+         dont le nom contient « audit » (« Audit SNA »…). Plusieurs candidats = erreur ;
+      2. sinon la **1re feuille** du classeur, si sa ligne 1 contient « ID erreur ».
+         Le journal le signale (📄). Sans « ID erreur », le fichier est refusé plutôt
+         que d'écrire dans une feuille qui n'est pas la bonne.
     - Aucune colonne cochée → l'Excel n'est pas modifié (seuls les PPT le sont).
   - **PPT** (cases exclusives) :
     - *Remplacer les PPT* : `cas_analyse_<ID>.pptx` est écrasé par celui de Prod IA ;
