@@ -24,6 +24,14 @@ def test_lister_communes_prod(tmp_path):
     assert lister_communes_prod(str(tmp_path / "absent")) == {}
 
 
+def test_lister_communes_prod_prefere_le_dossier_au_nom_exact(tmp_path):
+    for d in ("73283 - Copie", "73283", "73283_ancien", "LOT 81046"):
+        (tmp_path / d).mkdir()
+    res = lister_communes_prod(str(tmp_path))
+    assert res["73283"] == str(tmp_path / "73283")
+    assert res["81046"] == str(tmp_path / "LOT 81046")
+
+
 def test_detecter_colonnes(tmp_path):
     root, _, _ = arbo(tmp_path)
     cols, f, _ = detecter_colonnes(str(tmp_path / "prod"), str(root))

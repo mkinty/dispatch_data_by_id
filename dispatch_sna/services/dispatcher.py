@@ -1,6 +1,7 @@
 """Orchestration du rangement : commune complète, ou mise à jour ciblée par ID erreur.
 Aucune dépendance à l'interface : la progression passe par log_fn / phase_fn."""
 import os
+import re
 import shutil
 
 from .constantes import (AUDIT_PREFIX, PPT_FOLDER, PPT_PREFIX, COL_REMARQUE, COL_LIEN_SV,
@@ -105,6 +106,46 @@ def _journal_affichage(a, fichier, log_fn):
         log_fn(f"    ⚠️ {fichier} : affichage non rétabli ({e}) — sans effet sur la recherche des ID", LOG_WARN)
 
 
+def _cle_ppt(nom: str) -> str:
+    """Nom de PPT normalisé pour repérer les quasi-doublons : casse, espaces, « (1) »,
+    zéros en tête du numéro (cas_analyse_73150_088 ≈ cas_analyse_73150_88)."""
+    base = re.sub(r"\s*\(\d+\)", "", os.path.splitext(nom)[0]).casefold().replace(" ", "")
+    return re.sub(r"_0+(\d)", r"_\1", base)
+
+
+def trouver_ppt(dossier_src, nom, dst=None):
+    """Cherche le PPT `nom` dans le dossier commune de Prod IA.
+
+    Retourne (chemin, info) : chemin = fichier à utiliser (nom exact, ou même nom à la casse
+    près, éventuellement dans un sous-dossier) ou None ; info = explication pour le journal
+    (où il a été trouvé, ou ce que contient le dossier quand il est absent)."""
+    exact = os.path.join(dossier_src, nom)
+    if os.path.isfile(exact):
+        return exact, ""
+    ppts, autres, proches = [], 0, []
+    for racine, _dossiers, fichiers in os.walk(dossier_src):
+        for f in fichiers:
+            if f.casefold() == nom.casefold():
+                rel = os.path.relpath(os.path.join(racine, f), dossier_src)
+                return os.path.join(racine, f), f"trouvé sous le nom « {rel} »"
+            if f.lower().endswith(".pptx"):
+                ppts.append(f)
+                if _cle_ppt(f) == _cle_ppt(nom):
+                    proches.append(os.path.relpath(os.path.join(racine, f), dossier_src))
+            else:
+                autres += 1
+    if proches:
+        info = f"nom proche présent, non utilisé par prudence : {', '.join(proches[:3])} (renommez-le en {nom})"
+    elif not ppts:
+        info = f"le dossier ne contient aucun PPT ({autres} autre(s) fichier(s))"
+    else:
+        apercu = ", ".join(sorted(ppts)[:3]) + (" …" if len(ppts) > 3 else "")
+        info = f"le dossier contient {len(ppts)} autre(s) PPT ({apercu})"
+    if dst and os.path.isfile(dst):
+        info += " ; un PPT existe déjà dans SharePoint pour cet ID (peut-être déjà livré)"
+    return None, info
+
+
 def _autres_ppt(dossier, saisis) -> list[str]:
     """ID des cas_analyse_<ID>.pptx du dossier qui ne font pas partie des ID saisis."""
     res = []
@@ -192,13 +233,21 @@ def ranger_ids(root_sp, commune, dossier_src, ids, ppt_mode, supprimer, log_fn, 
     colonnes : colonnes Excel à mettre à jour (None = toutes, [] = aucune).
     maj_excel : fonction (src, dst, ids, colonnes) → résultat ; par défaut réécriture du
                 fichier (maj_lignes_excel), ou SessionExcel.maj_lignes pour la co-édition.
-    Retourne un dict stats (dont "echecs" : {ID → raison}) ou None si erreur bloquante."""
+    Retourne un dict stats (dont "echecs" : {ID → raison}). Si la commune ne peut pas être
+    traitée du tout, stats["bloquant"] donne la raison, reprise pour chacun de ses ID."""
     def phase(n, e="run"):
         if phase_fn: phase_fn(n, e)
 
     def echec(liste, raison):
         for i in liste:
             stats["echecs"][i] = f"{stats['echecs'][i]} ; {raison}" if i in stats["echecs"] else raison
+
+    def bloquant(etape, raison, conseil=""):
+        log_fn(f"  ❌ {raison[0].upper()}{raison[1:]}" + (f"\n     → {conseil}" if conseil else ""), LOG_ERR)
+        stats["bloquant"] = raison; stats["err"] += 1
+        echec(ids, raison + (f" — {conseil}" if conseil else ""))
+        phase(etape, "err")
+        return stats
 
     maj_excel = maj_excel or maj_lignes_excel
     dep = get_dep(commune)
@@ -215,14 +264,15 @@ def ranger_ids(root_sp, commune, dossier_src, ids, ppt_mode, supprimer, log_fn, 
     # 1. Vérifications
     phase("verif", "run")
     if not dossier_src or not os.path.isdir(dossier_src):
-        log_fn(f"  ❌ Aucun dossier {commune} dans Prod IA", LOG_ERR)
-        phase("verif", "err"); return None
+        return bloquant("verif", f"aucun dossier {commune} dans Prod IA",
+                        "commune déjà rangée lors d'un précédent dispatch (son dossier est supprimé "
+                        "après un rangement réussi), ou dossier pas encore déposé")
     if not os.path.isdir(dossier_dst):
-        log_fn(f"  ❌ Destination introuvable : {dep}/{commune}", LOG_ERR)
-        phase("verif", "err"); return None
+        return bloquant("verif", f"dossier SharePoint {dep}/{commune} introuvable",
+                        "vérifiez la racine SharePoint et la synchronisation OneDrive de ce département")
     if excel_voulu and not os.path.isfile(excel_dst):
-        log_fn(f"  ❌ Excel SharePoint introuvable : {dep}/{commune}/{nom_dst}", LOG_ERR)
-        phase("verif", "err"); return None
+        return bloquant("verif", f"Excel SharePoint {dep}/{commune}/{nom_dst} introuvable",
+                        "pour ne traiter que les PPT, décochez toutes les colonnes Excel")
     phase("verif", "ok")
 
     # 2. Excel source
@@ -232,9 +282,9 @@ def ranger_ids(root_sp, commune, dossier_src, ids, ppt_mode, supprimer, log_fn, 
     nom_src = nom_src if nom_src in excels else (excels[0] if excels else None)
     excel_src = os.path.join(dossier_src, nom_src) if nom_src else None
     if besoin_src and not nom_src:
-        log_fn(f"  ❌ Aucun Excel dans Prod IA/{commune}"
-               + ("" if excel_voulu else " (nécessaire pour modifier les PPT)"), LOG_ERR)
-        phase("analyse", "err"); return None
+        return bloquant("analyse", f"aucun Excel dans Prod IA/{commune}",
+                        "nécessaire pour lire Remarque / Lien Street View en mode « Modifier les PPT »"
+                        if not excel_voulu else "il contient les valeurs à reporter dans SharePoint")
     log_fn(f"  🔎 {len(ids)} ID erreur" + (f" · source {nom_src}" if besoin_src else " · PPT seuls"), LOG_INFO)
     phase("analyse", "ok")
 
@@ -275,9 +325,12 @@ def ranger_ids(root_sp, commune, dossier_src, ids, ppt_mode, supprimer, log_fn, 
             src, dst = os.path.join(dossier_src, nom), os.path.join(ppt_dst, nom)
             try:
                 if ppt_mode == "remplacer" or not os.path.isfile(dst):
-                    if not os.path.isfile(src):
-                        stats["err"] += 1; echec([id_err], "PPT absent de Prod IA")
-                        log_fn(f"    ⚠️ {nom} absent de Prod IA/{commune}", LOG_WARN); continue
+                    src, info = trouver_ppt(dossier_src, nom, dst)
+                    if src is None:
+                        stats["err"] += 1; echec([id_err], f"PPT absent de Prod IA — {info}")
+                        log_fn(f"    ⚠️ {nom} absent de Prod IA/{commune} : {info}", LOG_WARN); continue
+                    if info:
+                        log_fn(f"    ℹ️ {nom} : {info}", LOG_INFO)
                     if ppt_mode == "modifier":
                         log_fn(f"    ℹ️ {nom} absent de SharePoint → copie du nouveau PPT", LOG_INFO)
                     copier_ppt(src, dst); a_liberer.append(dst); stats["ppt"] += 1

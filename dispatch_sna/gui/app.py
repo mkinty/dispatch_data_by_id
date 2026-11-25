@@ -11,7 +11,7 @@ from tkinter import ttk, filedialog, messagebox
 
 from contextlib import nullcontext
 
-from ..config import load_config, save_config, ATTENTE_FILE
+from ..config import load_config, save_config, ATTENTE_FILE, RAPPORTS_DIR
 from ..services import attente
 from ..services.chemins import get_dep, lister_communes_prod, detecter_colonnes, supprimer_si_vide
 from ..services.constantes import COL_ID_ERR
@@ -33,6 +33,20 @@ class _EtatPartage(dict):
             self.setdefault("_lignes", []).append((cle, valeur))
         else:
             super().__setitem__(cle, valeur)
+
+
+def _apercu(elements, n=8):
+    elements = list(elements)
+    return ", ".join(elements[:n]) + (f" … (+{len(elements) - n})" if len(elements) > n else "")
+
+
+def _statut_bloquant(raison):
+    """Libellé court du tableau pour une commune qui n'a pas pu être traitée."""
+    for motif, libelle in (("dans Prod IA", "❌ Absent de Prod IA"), ("dossier SharePoint", "❌ Dest. absente"),
+                           ("Excel SharePoint", "❌ Excel SP absent"), ("aucun Excel", "❌ Excel Prod IA absent")):
+        if motif in raison:
+            return libelle
+    return "❌ Non traité"
 
 
 SEUIL_COMMUNES_ONEDRIVE_KO = 3   # communes consécutives refusées par OneDrive avant pause, puis arrêt du lot
@@ -697,8 +711,19 @@ class App(tk.Tk):
         excel_com = bool(self.var_excel_com.get()) and self._excel_ok
         ecriture_txt = ("Écriture → via Excel, en co-édition SharePoint (valeurs vérifiées)" if excel_com
                         else "Écriture → réécriture du fichier (⚠️ perdue si le fichier est ouvert ailleurs)")
+        # Bilan préalable : ce qui ne pourra pas être traité, dit AVANT de lancer
+        sans_prod = [c for c in codes if c not in dispo]
+        sans_sp = [c for c in codes if c in dispo and not os.path.isdir(os.path.join(root_sp, get_dep(c), c))]
+        prealable = ""
+        if sans_prod:
+            prealable += (f"⚠️ {len(sans_prod)} commune(s) sur {len(codes)} n'ont PAS de dossier dans Prod IA "
+                          f"({_apercu(sans_prod)}) : déjà rangées lors d'un précédent dispatch (dossier supprimé "
+                          "après succès) ou pas encore déposées. Elles seront signalées sans être traitées.\n")
+        if sans_sp:
+            prealable += f"⚠️ {len(sans_sp)} commune(s) sans dossier SharePoint ({_apercu(sans_sp)}).\n"
         if not messagebox.askyesno("Mise à jour par ID erreur",
-                f"Mettre à jour {nb} ID erreur sur {len(codes)} commune(s) : {', '.join(codes)} ?\n\n"
+                f"Mettre à jour {nb} ID erreur sur {len(codes)} commune(s) : {_apercu(codes, 12)} ?\n\n"
+                + (prealable + "\n" if prealable else "") +
                 f"• {excel_txt}\n"
                 f"• {ecriture_txt}\n"
                 f"• {ppt_txt}\n"
@@ -717,6 +742,8 @@ class App(tk.Tk):
             self._log(f"📊 {excel_txt}", C_MUTED)
             self._log(f"🔐 {ecriture_txt}", C_MUTED)
             self._log(f"🖼️  {ppt_txt}", C_MUTED)
+            if prealable:
+                self._log("\n" + prealable.rstrip(), C_AMBER)
             self._log("─"*50, C_MUTED)
             # Session surveillée : fil COM dédié + relance d'Excel s'il ne répond plus.
             # PPT seuls (aucune colonne cochée) : Excel n'est pas lancé du tout.
@@ -746,7 +773,12 @@ class App(tk.Tk):
                                            supprimer, self._log, phase_fn=self._cb_phase, colonnes=colonnes,
                                            maj_excel=xl.maj_lignes if xl else None)
                         self._state["gpos"]=i
-                        if stats is not None:
+                        if stats is not None and stats.get("bloquant"):
+                            tot["err"]+=1
+                            echecs.update(stats["echecs"])
+                            self._state["row_update"] = ((commune,dep,len(ids),"","","","",
+                                                          _statut_bloquant(stats["bloquant"])), False)
+                        elif stats is not None:
                             tot["communes"]+=1
                             for k in ("lignes","excel","ppt","err"): tot[k]+=stats[k]
                             echecs.update(stats["echecs"])
@@ -794,13 +826,12 @@ class App(tk.Tk):
                 self._log(f"\n❌ Traitement interrompu : {e}", C_RED)
             el=_time.time()-self._t_start
             liste = attente.mettre_a_jour(ATTENTE_FILE, echecs, reussis)
-            self._log(f"\n🎉 TERMINÉ — {tot['communes']} commune(s) en {self._fmt(el)}", C_GREEN)
+            entete = "🎉 TERMINÉ" if not echecs else "⚠️ TERMINÉ AVEC DES ÉCHECS"
+            self._log(f"\n{entete} — {tot['communes']} commune(s) traitée(s) sur {len(codes)} en {self._fmt(el)}",
+                      C_GREEN if not echecs else C_AMBER)
             self._log(f"  Lignes:{tot['lignes']} · PPT:{tot['ppt']} · Erreurs:{tot['err']}", C_MUTED)
             if echecs:
-                self._log(f"\n⏳ {len(echecs)} ID non appliqué(s) → ajoutés à la liste « ID en attente » "
-                          f"({len(liste)} au total) :", C_AMBER)
-                for x, raison in list(echecs.items())[:50]:
-                    self._log(f"   • {x} : {raison}", C_AMBER)
+                self._journal_echecs(echecs, len(liste))
             else:
                 self._log(f"\n✅ Tous les ID ont été appliqués" +
                           (f" · {len(liste)} ID restent en attente d'un précédent dispatch" if liste else ""), C_GREEN)
@@ -809,6 +840,23 @@ class App(tk.Tk):
             tot["_el"]=el; self._state["done"]=tot
 
         threading.Thread(target=do, daemon=True).start()
+
+    def _journal_echecs(self, echecs, total_attente):
+        """Bilan des échecs regroupés par cause (au lieu de N lignes « ID : raison »),
+        plus un rapport CSV complet."""
+        groupes = attente.regrouper(echecs)
+        self._log(f"\n⏳ {len(echecs)} ID non appliqué(s), {len(groupes)} cause(s) → liste « ID en attente » "
+                  f"({total_attente} au total) :", C_AMBER)
+        for g in groupes[:15]:
+            self._log(f"   • {len(g['ids'])} ID · {len(g['communes'])} commune(s) : {g['cause']}", C_AMBER)
+            self._log(f"       ex. : {_apercu(g['ids'], 6)}", C_MUTED)
+        if len(groupes) > 15:
+            self._log(f"   • … {len(groupes) - 15} autre(s) cause(s) : voir le rapport", C_AMBER)
+        try:
+            chemin = attente.ecrire_rapport(RAPPORTS_DIR, echecs)
+            self._log(f"📄 Détail de chaque ID (à ouvrir dans Excel) : {chemin}", C_ACCENT)
+        except OSError as e:
+            self._log(f"⚠️ Rapport CSV non écrit : {e}", C_AMBER)
 
     def _start_ui(self, n, hdr, status):
         for r in self.tree.get_children(): self.tree.delete(r)

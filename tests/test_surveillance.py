@@ -62,7 +62,8 @@ def test_ppt_seuls_modifier_supprime_le_dossier(tmp_path):
 
 def test_ppt_seuls_modifier_sans_excel_prod_est_bloquant(tmp_path):
     root, src, _ = _arbo(tmp_path, ["74143_1"], [], avec_excel_prod=False)
-    assert ranger_ids(str(root), "74143", str(src), ["74143_1"], "modifier", True, log, colonnes=[]) is None
+    st = ranger_ids(str(root), "74143", str(src), ["74143_1"], "modifier", True, log, colonnes=[])
+    assert st["bloquant"] == "aucun Excel dans Prod IA/74143" and "Modifier les PPT" in st["echecs"]["74143_1"]
     assert src.exists()
 
 
@@ -79,7 +80,8 @@ def test_ppt_seuls_ppt_d_autres_id_conserve_le_dossier(tmp_path):
 def test_ppt_seuls_erreur_ppt_conserve_le_dossier(tmp_path):
     root, src, _ = _arbo(tmp_path, ["74143_1"], [])                     # PPT absent de Prod IA
     st = ranger_ids(str(root), "74143", str(src), ["74143_1"], "remplacer", True, log, colonnes=[])
-    assert st["echecs"] == {"74143_1": "PPT absent de Prod IA"} and src.exists()
+    assert st["echecs"] == {"74143_1": "PPT absent de Prod IA — le dossier ne contient aucun PPT (1 autre(s) fichier(s)) ; un PPT existe déjà dans SharePoint pour cet ID (peut-être déjà livré)"}
+    assert src.exists()
 
 
 def test_colonnes_cochees_garde_la_regle_des_lignes_excel(tmp_path):

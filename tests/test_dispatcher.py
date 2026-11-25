@@ -44,7 +44,9 @@ def test_ranger_ids_aucune_colonne_mais_ppt_modifie(tmp_path):
 
 def test_ranger_ids_dossier_prod_absent(tmp_path):
     root, _, _ = arbo(tmp_path)
-    assert ranger_ids(str(root), "74143", None, ["74143_1"], "modifier", True, log) is None
+    st = ranger_ids(str(root), "74143", None, ["74143_1"], "modifier", True, log)
+    assert st["bloquant"] == "aucun dossier 74143 dans Prod IA"
+    assert st["echecs"]["74143_1"].startswith("aucun dossier 74143 dans Prod IA — commune déjà rangée")
 
 
 def test_ranger_commune_copie_tout_et_vide_prod(tmp_path):

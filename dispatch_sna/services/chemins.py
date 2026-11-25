@@ -136,14 +136,19 @@ def copier_remplacer(src, dst, log_fn):
 
 
 def lister_communes_prod(prod_ia):
-    """{code commune → dossier} des sous-dossiers commune de Prod IA."""
+    """{code commune → dossier} des sous-dossiers commune de Prod IA.
+
+    Si plusieurs dossiers portent le même code (« 73283 », « 73283 - Copie »…), le dossier
+    nommé exactement comme la commune l'emporte, sinon le premier par ordre alphabétique —
+    avant, c'était le dernier rencontré, donc parfois la copie au lieu du vrai dossier."""
     res = {}
     if not os.path.isdir(prod_ia): return res
-    for d in os.listdir(prod_ia):
+    for d in sorted(os.listdir(prod_ia)):
         full = os.path.join(prod_ia, d)
         if os.path.isdir(full):
             com = extraire_commune_nom(d)
-            if com: res[com] = full
+            if com and (com not in res or d.upper() == com):
+                res[com] = full
     return res
 
 def supprimer_si_vide(prod_ia, log_fn):

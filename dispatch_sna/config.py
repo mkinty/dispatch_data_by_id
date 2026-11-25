@@ -5,6 +5,7 @@ import os
 RACINE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_FILE = os.path.join(RACINE, "config_dispatcher.json")
 ATTENTE_FILE = os.path.join(RACINE, "ids_en_attente.json")   # ID non appliqués, à rejouer
+RAPPORTS_DIR = os.path.join(RACINE, "rapports")              # détail CSV des échecs de chaque lot
 
 DEFAULT_CFG = {
     "root_sp":  r"C:\Users\u269775\Altice Campus SFR\Swap Adresse - Etude Cible\audit_SNA",
