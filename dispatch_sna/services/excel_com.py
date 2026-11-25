@@ -46,6 +46,26 @@ def _est_rejet(e) -> bool:
     return bool(getattr(e, "args", None)) and e.args[0] in _REJETS
 
 
+# L'application Excel elle-même a disparu ou ne répond plus : seule une instance neuve peut continuer.
+_DECONNEXIONS = (-2147417848,   # 0x80010108 RPC_E_DISCONNECTED « déconnecté de ses clients »
+                 -2147023174,   # 0x800706BA serveur RPC indisponible
+                 -2147023170,   # 0x800706BE l'appel de procédure distante a échoué
+                 -2147417851)   # 0x80010105 RPC_E_SERVERFAULT
+_DISP_E_EXCEPTION = -2147352567
+_OBJET_REQUIS = -2146827864     # 0x800A01A8 : objet invalidé (classeur rechargé par la fusion co-édition)
+
+
+def _est_deconnexion(e) -> bool:
+    return bool(getattr(e, "args", None)) and e.args[0] in _DECONNEXIONS
+
+
+def _est_objet_invalide(e) -> bool:
+    """Objet COM rendu caduc par un rechargement du classeur (fusion SharePoint) : il suffit de rouvrir."""
+    args = getattr(e, "args", None) or ()
+    info = args[2] if len(args) > 2 else None
+    return bool(args) and args[0] == _DISP_E_EXCEPTION and bool(info) and len(info) > 5 and info[5] == _OBJET_REQUIS
+
+
 class _FiltreMessages:
     """Filtre de messages COM (IMessageFilter) pour le thread courant.
 
@@ -56,11 +76,12 @@ class _FiltreMessages:
     """
     _ATTENTE_MS = 250
 
-    def __init__(self, delai_max_ms=120_000):
+    def __init__(self, delai_max_ms=120_000, signe_de_vie=None):
         import ctypes
         import uuid
         from ctypes import wintypes
         self.delai_max_ms = delai_max_ms
+        self.signe_de_vie = signe_de_vie
         self._ancien = ctypes.c_void_p()
         self._installe = False
         HRESULT, DWORD, ULONG, LPVOID = ctypes.c_long, wintypes.DWORD, ctypes.c_ulong, ctypes.c_void_p
@@ -83,6 +104,9 @@ class _FiltreMessages:
 
         def retry_rejected(this, task, tick, reject_type):
             # tick = ms écoulées depuis le 1er refus de CET appel ; 0xFFFFFFFF = abandon
+            if self.signe_de_vie:
+                try: self.signe_de_vie()
+                except Exception: pass
             return self._ATTENTE_MS if tick < self.delai_max_ms else 0xFFFFFFFF
 
         def message_pending(this, task, tick, pending_type):
@@ -261,6 +285,40 @@ def _terminer_si_toujours_ouvert(pid, attente_s=15):
     try:
         if win32event.WaitForSingleObject(h, int(attente_s * 1000)) == win32event.WAIT_TIMEOUT:
             win32api.TerminateProcess(h, 1)
+            win32event.WaitForSingleObject(h, 15_000)
+    finally:
+        win32api.CloseHandle(h)
+
+
+def _processus_vivant(pid) -> bool:
+    if not pid:
+        return True                                    # inconnu : on ne conclut pas à sa disparition
+    try:
+        import win32api, win32con, win32event
+        h = win32api.OpenProcess(win32con.SYNCHRONIZE, False, pid)
+    except Exception:
+        return False
+    try:
+        return win32event.WaitForSingleObject(h, 0) == win32event.WAIT_TIMEOUT
+    finally:
+        win32api.CloseHandle(h)
+
+
+def _tuer(pid, attente_s=15) -> bool:
+    """Termine le processus `pid` et attend qu'il ait VRAIMENT disparu : rouvrir le même fichier
+    alors que Windows n'a pas encore relâché ses verrous donne un objet Excel à moitié initialisé."""
+    if not pid:
+        return False
+    try:
+        import win32api, win32con, win32event
+        h = win32api.OpenProcess(win32con.SYNCHRONIZE | win32con.PROCESS_TERMINATE, False, pid)
+    except Exception:
+        return True                                    # déjà terminé
+    try:
+        win32api.TerminateProcess(h, 1)
+        return win32event.WaitForSingleObject(h, int(attente_s * 1000)) == win32event.WAIT_OBJECT_0
+    except Exception:
+        return False
     finally:
         win32api.CloseHandle(h)
 
@@ -276,11 +334,17 @@ class SessionExcel:
     TENTATIVES = 3              # essais complets d'un classeur si Excel reste occupé au-delà du délai
 
     def __init__(self, visible=False, delai_occupe_s=120):
+        import time
         self.visible = visible
         self.delai_occupe_s = delai_occupe_s
         self.xl = None
         self._filtre = None
         self._pid = None
+        self.activite = time.time()     # dernier signe de vie d'Excel (lu par SessionExcelSurveillee)
+
+    def _vivant(self):
+        import time
+        self.activite = time.time()
 
     def __enter__(self):
         try:
@@ -290,7 +354,8 @@ class SessionExcel:
             raise ExcelIndisponible("pywin32 n'est pas installé") from e
         pythoncom.CoInitialize()
         # Avant tout appel à Excel : les refus « occupé » seront réessayés au lieu d'échouer
-        self._filtre = _FiltreMessages(delai_max_ms=int(self.delai_occupe_s * 1000))
+        # Un refus « occupé » réessayé prouve qu'Excel est vivant : c'est un signe de vie.
+        self._filtre = _FiltreMessages(delai_max_ms=int(self.delai_occupe_s * 1000), signe_de_vie=self._vivant)
         self._filtre.installer()
         try:
             self.xl = wc.DispatchEx("Excel.Application")   # nouvelle instance, n'interfère pas avec l'Excel ouvert
@@ -299,6 +364,10 @@ class SessionExcel:
             self.xl.DisplayAlerts = False
             self.xl.AskToUpdateLinks = False
             self.xl.ScreenUpdating = bool(self.visible)
+            if not self.visible:
+                try: self.xl.Interactive = False   # aucune saisie possible dans cette instance invisible
+                except Exception: pass
+            self._vivant()
         except Exception as e:
             self.__exit__(None, None, None)
             raise ExcelIndisponible(f"impossible de démarrer Excel : {e}") from e
@@ -331,7 +400,9 @@ class SessionExcel:
         while time.time() < limite:
             try:
                 if self.xl.Ready:
+                    self._vivant()
                     return
+                self._vivant()                       # Excel répond (« pas prêt ») : il est vivant
             except Exception as e:
                 if not _est_rejet(e):
                     raise
@@ -455,9 +526,13 @@ class SessionExcel:
                 res["tentatives"] = essai
                 return res
             except Exception as e:
-                if not (_est_rejet(e) or isinstance(e, ExcelOccupe)):
+                # Objet invalidé par une fusion SharePoint (0x800A01A8) : rouvrir le classeur suffit
+                if not (_est_rejet(e) or isinstance(e, ExcelOccupe) or _est_objet_invalide(e)):
                     raise
                 if essai == self.TENTATIVES:
+                    if _est_objet_invalide(e):
+                        raise ExcelErreur(f"classeur rechargé par la co-édition pendant l'écriture, "
+                                          f"{self.TENTATIVES} fois de suite : rejouez plus tard") from e
                     raise ExcelOccupe(
                         f"Excel est resté occupé ({self.TENTATIVES} essais de {self.delai_occupe_s} s) — "
                         "synchronisation ou co-édition en cours ? Les ID sont mis en attente, "
@@ -476,9 +551,17 @@ class SessionExcel:
                 res["col_absentes"] = sorted(voulues - set(lecture["entetes"]))
             return res                          # aucune colonne → on n'ouvre même pas le classeur
 
+        self._vivant()
         wb, res["ouverture"] = self._ouvrir(dst)
+        self._vivant()
         calcul = None
         try:
+            # Enregistrement automatique coupé pour NOTRE instance : chaque sauvegarde auto
+            # déclenche une fusion SharePoint (et sa fenêtre « Nous rechargeons votre classeur… »).
+            # On enregistre une seule fois, à la fin. Sans effet pour les collègues.
+            try: wb.AutoSaveOn = False
+            except Exception as e:
+                if _est_rejet(e): raise
             self._attendre_pret()
             if wb.ReadOnly:
                 try: qui = wb.WriteReservedBy
@@ -518,6 +601,7 @@ class SessionExcel:
                     res["absents_dst"].append(i); continue
                 faits = []
                 for nom, cel in cells.items():
+                    self._vivant()
                     c = entetes.get(nom)
                     if c is None:
                         continue
@@ -544,10 +628,15 @@ class SessionExcel:
             self._attendre_pret()
 
             wb.Save()
+            self._vivant()
             self._attendre_pret()
             # Relecture : un ID n'est compté que si TOUTES ses cellules sont bien en place
+            # Pas de « wb.Saved » ici : c'est un drapeau GLOBAL du classeur, remis à False par la
+            # moindre activité de co-édition des collègues ; il rejetait à tort tous les ID d'une
+            # commune. Save() a abouti sans erreur ; seule la relecture de NOS cellules fait foi.
             for i, faits in ecrits.items():
-                if wb.Saved and all(_conforme(cell, a, l) for cell, a, l in faits):
+                self._vivant()
+                if all(_conforme(cell, a, l) for cell, a, l in faits):
                     res["maj"].append(i)
                 else:
                     res["non_verifies"].append(i)
@@ -558,3 +647,132 @@ class SessionExcel:
                 except Exception: pass
             try: wb.Close(False)
             except Exception: pass
+
+
+# ── session surveillée (anti-blocage) ─────────────────────────────
+class ExcelBloque(Exception):
+    """Excel n'a plus donné signe de vie : très probablement une fenêtre modale invisible."""
+
+
+class SessionExcelSurveillee:
+    """Même usage que SessionExcel, avec un garde-fou contre le blocage définitif.
+
+    Pourquoi : Excel tourne invisible. Si SharePoint affiche une boîte modale (« Nous
+    rechargeons votre classeur pour terminer la fusion »…), personne ne peut cliquer dessus et
+    l'appel COM en cours (souvent Save) ne revient JAMAIS : sans garde-fou, l'outil gèle.
+
+    Comment : la session Excel vit sur un fil dédié, propriétaire de son appartement COM, qui
+    exécute les classeurs un par un. Le fil appelant attend le résultat en surveillant
+    SessionExcel.activite (signes de vie : réponses d'Excel, refus « occupé » réessayés,
+    avancement cellule par cellule). Sans signe de vie pendant `delai_blocage_s`, le processus
+    de CETTE instance est tué (jamais l'Excel de l'utilisateur), on attend sa disparition, une
+    instance neuve est lancée et le classeur est retenté. Au pire une commune échoue (ExcelBloque)
+    et ses ID rejoignent « ID en attente » : l'outil ne gèle plus.
+    """
+
+    def __init__(self, visible=False, delai_occupe_s=120, delai_blocage_s=120, essais=2):
+        self.visible, self.delai_occupe_s = visible, delai_occupe_s
+        self.delai_blocage_s, self.essais = delai_blocage_s, essais
+        self._fil = None
+        self.relances = 0          # nombre d'instances Excel tuées puis relancées
+
+    # cycle de vie ---------------------------------------------------
+    def __enter__(self):
+        self._demarrer()
+        return self
+
+    def __exit__(self, *exc):
+        self._arreter(proprement=True)
+        return False
+
+    def _demarrer(self):
+        import queue, threading
+        etat = {"pret": threading.Event(), "jobs": queue.Queue(), "session": None, "erreur": None}
+
+        def boucle():
+            try:
+                s = SessionExcel(visible=self.visible, delai_occupe_s=self.delai_occupe_s)
+                s.__enter__()
+            except BaseException as e:
+                etat["erreur"] = e; etat["pret"].set(); return
+            etat["session"] = s; etat["pret"].set()
+            try:
+                while True:
+                    job = etat["jobs"].get()
+                    if job is None:
+                        break
+                    fn, args, boite = job
+                    try:
+                        boite["res"] = getattr(s, fn)(*args)
+                    except BaseException as e:
+                        boite["err"] = e
+                    boite["fait"].set()
+            finally:
+                try: s.__exit__(None, None, None)
+                except BaseException: pass
+
+        fil = threading.Thread(target=boucle, name="excel-com", daemon=True)
+        fil.start()
+        if not etat["pret"].wait(max(60, self.delai_blocage_s)):
+            raise ExcelIndisponible("Excel n'a pas démarré dans le délai")
+        if etat["erreur"] is not None:
+            e = etat["erreur"]
+            raise e if isinstance(e, ExcelIndisponible) else ExcelIndisponible(str(e))
+        self._fil, self._etat = fil, etat
+
+    def _arreter(self, proprement):
+        if self._fil is None:
+            return
+        etat, fil, self._fil = self._etat, self._fil, None
+        if proprement:
+            etat["jobs"].put(None)
+            fil.join(60)
+        if fil.is_alive() and etat["session"] is not None:   # bloqué : on coupe court
+            _tuer(etat["session"]._pid)
+            fil.join(20)
+
+    def _relancer(self):
+        """Tue l'instance bloquée, attend sa disparition, en démarre une neuve."""
+        etat, self._fil = self._etat, None
+        _tuer(etat["session"]._pid)
+        etat["jobs"].put(None)              # le fil débloqué (appel COM en erreur) s'arrêtera
+        self.relances += 1
+        self._demarrer()
+
+    # travail ----------------------------------------------------------
+    def _executer(self, fn, *args):
+        import threading, time
+        boite = {"fait": threading.Event()}
+        session = self._etat["session"]
+        session._vivant()
+        self._etat["jobs"].put((fn, args, boite))
+        while not boite["fait"].wait(1.0):
+            if time.time() - session.activite > self.delai_blocage_s:
+                raise ExcelBloque(f"Excel ne répond plus depuis {self.delai_blocage_s} s "
+                                  "(fenêtre bloquante invisible, ex. « Nous rechargeons votre classeur… »)")
+        if "err" in boite:
+            raise boite["err"]
+        return boite["res"]
+
+    def maj_lignes(self, src, dst, ids, colonnes=None) -> dict:
+        """SessionExcel.maj_lignes, protégé contre le blocage et la perte de l'instance Excel."""
+        derniere = None
+        for essai in range(1, self.essais + 1):
+            if self._fil is None:
+                self._demarrer()
+            try:
+                res = self._executer("maj_lignes", src, dst, ids, colonnes)
+                if essai > 1:
+                    res["relance_excel"] = essai - 1
+                return res
+            except ExcelBloque as e:
+                derniere = e
+            except Exception as e:
+                # Excel a disparu (plantage, fermeture forcée) : pywin32 masque parfois la
+                # déconnexion en AttributeError ; on vérifie donc le processus lui-même.
+                if not (_est_deconnexion(e) or not _processus_vivant(self._etat["session"]._pid)):
+                    raise
+                derniere = e
+            self._relancer()
+        raise ExcelBloque(f"{derniere} — {self.essais} essai(s) avec une instance Excel neuve, "
+                          "commune mise en attente") from derniere

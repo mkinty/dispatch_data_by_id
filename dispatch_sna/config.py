@@ -18,6 +18,7 @@ DEFAULT_CFG = {
     "excel_com": True,      # mode ids : écrire via Excel (co-édition SharePoint) plutôt que réécrire le fichier
     "excel_visible": False, # mode ids : afficher Excel pendant l'écriture (diagnostic)
     "excel_delai_occupe_s": 120,  # mode ids : attente max quand Excel répond « occupé » (par appel)
+    "excel_delai_blocage_s": 120, # mode ids : sans signe de vie d'Excel pendant ce délai, il est tué et relancé
 }
 
 

@@ -98,6 +98,35 @@ les co-éditeurs, de recalculer ou d'enregistrer, il refuse les commandes
    (3 essais). En dernier recours, les ID partent dans la liste d'attente avec
    la raison « Excel est resté occupé ».
 
+**Excel bloqué sur une fenêtre invisible** : si SharePoint affiche une boîte
+modale (« Nous rechargeons votre classeur pour terminer la fusion »…), personne
+ne peut cliquer dessus dans l'Excel invisible, et l'appel en cours ne revient
+jamais. La session est donc **surveillée** (`SessionExcelSurveillee`) :
+- Excel tourne sur un fil dédié, propriétaire de sa session COM ;
+- l'outil surveille ses signes de vie : réponses, refus « occupé » réessayés,
+  avancement cellule par cellule ;
+- sans signe de vie pendant `excel_delai_blocage_s` (120 s), le processus de
+  **cette** instance est tué (jamais l'Excel de l'utilisateur), l'outil attend sa
+  disparition effective, en relance une neuve et retente le classeur ;
+- une instance Excel disparue (plantage) est relancée de la même façon.
+
+L'outil ne gèle donc plus : au pire, une commune échoue et ses ID rejoignent la
+liste « ID en attente ». L'enregistrement automatique est coupé pour l'instance de
+l'outil, pour éviter des fusions à répétition.
+
+**Vérification après enregistrement** : elle repose uniquement sur la relecture
+des cellules écrites. Le drapeau `Saved` du classeur n'est plus utilisé : la
+moindre activité de co-édition d'un collègue le remet à faux, et il faisait
+rejeter à tort tous les ID d'une commune.
+
+**PPT seuls** (aucune colonne cochée) : aucun Excel n'est écrit, et Excel n'est
+même pas lancé. L'Excel Prod IA ne sert qu'à lire Remarque et Lien Street View
+en mode « Modifier ». Les ID absents de cet Excel ne sont donc plus des erreurs
+en mode « Remplacer ». Le dossier Prod IA de la commune est supprimé dès que les
+PPT ont été traités sans erreur, même s'il contient l'Excel. Seul cas où il est
+conservé : il contient des PPT d'autres ID, non saisis, qui ne sont pas encore
+livrés.
+
 **Filtres et colonnes masquées** : à chaque mise à jour par ID, dans l'onglet
 `Audit` uniquement, l'outil retire les critères de filtre (tableaux Excel
 compris) et réaffiche les lignes et colonnes masquées, côté Prod IA comme côté

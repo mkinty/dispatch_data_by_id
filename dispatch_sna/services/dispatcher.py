@@ -3,7 +3,7 @@ Aucune dépendance à l'interface : la progression passe par log_fn / phase_fn."
 import os
 import shutil
 
-from .constantes import (AUDIT_PREFIX, PPT_FOLDER, COL_REMARQUE, COL_LIEN_SV,
+from .constantes import (AUDIT_PREFIX, PPT_FOLDER, PPT_PREFIX, COL_REMARQUE, COL_LIEN_SV,
                          LOG_OK, LOG_INFO, LOG_WARN, LOG_ERR)
 from .chemins import get_dep, onedrive_pin, copier_remplacer
 from .error_ids import nom_ppt
@@ -102,58 +102,22 @@ def _journal_affichage(a, fichier, log_fn):
         log_fn(f"    ⚠️ {fichier} : affichage non rétabli ({e}) — sans effet sur la recherche des ID", LOG_WARN)
 
 
-def ranger_ids(root_sp, commune, dossier_src, ids, ppt_mode, supprimer, log_fn, phase_fn=None,
-               colonnes=None, maj_excel=None):
-    """Met à jour Dep/commune uniquement pour les ID erreur donnés.
-    ppt_mode : "remplacer", "modifier" ou None (Excel seul).
-    colonnes : colonnes Excel à mettre à jour (None = toutes, [] = aucune).
-    maj_excel : fonction (src, dst, ids, colonnes) → résultat ; par défaut réécriture du
-                fichier (maj_lignes_excel), ou SessionExcel.maj_lignes pour la co-édition.
-    Retourne un dict stats (dont "echecs" : {ID → raison}) ou None si erreur bloquante."""
-    def phase(n, e="run"):
-        if phase_fn: phase_fn(n, e)
+def _autres_ppt(dossier, saisis) -> list[str]:
+    """ID des cas_analyse_<ID>.pptx du dossier qui ne font pas partie des ID saisis."""
+    res = []
+    for f in sorted(os.listdir(dossier)):
+        if f.lower().startswith(PPT_PREFIX) and f.lower().endswith(".pptx"):
+            i = f[len(PPT_PREFIX):-len(".pptx")].upper()
+            if i not in saisis:
+                res.append(i)
+    return res
 
-    def echec(liste, raison):
-        for i in liste:
-            stats["echecs"][i] = f"{stats['echecs'][i]} ; {raison}" if i in stats["echecs"] else raison
 
-    maj_excel = maj_excel or maj_lignes_excel
-    dep = get_dep(commune)
-    dossier_dst = os.path.join(root_sp, dep, commune)
-    ppt_dst = os.path.join(dossier_dst, PPT_FOLDER)
-    excel_dst = os.path.join(dossier_dst, f"{AUDIT_PREFIX}{commune}.xlsx")
-    stats = {"lignes": 0, "excel": 0, "ppt": 0, "err": 0, "echecs": {}}
-
-    # 1. Vérifications
-    phase("verif", "run")
-    if not dossier_src or not os.path.isdir(dossier_src):
-        log_fn(f"  ❌ Aucun dossier {commune} dans Prod IA", LOG_ERR)
-        phase("verif", "err"); return None
-    if not os.path.isdir(dossier_dst):
-        log_fn(f"  ❌ Destination introuvable : {dep}/{commune}", LOG_ERR)
-        phase("verif", "err"); return None
-    if not os.path.isfile(excel_dst):
-        log_fn(f"  ❌ Excel SharePoint introuvable : {dep}/{commune}/{os.path.basename(excel_dst)}", LOG_ERR)
-        phase("verif", "err"); return None
-    phase("verif", "ok")
-
-    # 2. Excel source
-    phase("analyse", "run")
-    excels = [f for f in os.listdir(dossier_src) if f.lower().endswith(".xlsx") and not f.startswith("~")]
-    nom_src = f"{AUDIT_PREFIX}{commune}.xlsx"
-    nom_src = nom_src if nom_src in excels else (excels[0] if excels else None)
-    if not nom_src:
-        log_fn(f"  ❌ Aucun Excel dans Prod IA/{commune}", LOG_ERR)
-        phase("analyse", "err"); return None
-    excel_src = os.path.join(dossier_src, nom_src)
-    log_fn(f"  🔎 {len(ids)} ID erreur · source {nom_src}", LOG_INFO)
-    phase("analyse", "ok")
-
-    # 3. Excel : remplacement des seules lignes des ID
-    phase("excel", "run")
+def _etape_excel(maj_excel, excel_src, excel_dst, ids, colonnes, commune, dep, nom_src, nom_dst,
+                 stats, echec, log_fn):
+    """Étape 3 de ranger_ids (au moins une colonne cochée) : écrit les lignes des ID.
+    Retourne (donnees, ids_src) ; erreurs et échecs par ID vont dans stats / echec."""
     donnees, ids_src = None, []
-    excel_voulu = colonnes is None or bool(colonnes)
-    nom_dst = os.path.basename(excel_dst)
     # Source : la lecture ne dépend pas des filtres, ce retrait n'est donc jamais bloquant
     try:
         _journal_affichage(retirer_filtres_fichier(excel_src), f"Prod IA/{commune}/{nom_src}", log_fn)
@@ -171,12 +135,13 @@ def ranger_ids(root_sp, commune, dossier_src, ids, ppt_mode, supprimer, log_fn, 
         _journal_affichage(r.get("affichage"), f"{dep}/{commune}/{nom_dst}", log_fn)
         donnees, ids_src = r["donnees"], r["ids_src"]
         stats["lignes"] = len(r["maj"]); stats["excel"] = 1 if r["maj"] else 0
-        if not excel_voulu:
-            log_fn("  ⏭️ Excel non modifié (aucune colonne cochée)", LOG_INFO)
         if r.get("ouverture"):
             log_fn(f"  🔗 {nom_dst} ouvert dans Excel ({r['ouverture']})", LOG_INFO)
         if r.get("tentatives", 1) > 1:
             log_fn(f"    ℹ️ Excel était occupé : réussi au {r['tentatives']}e essai", LOG_INFO)
+        if r.get("relance_excel"):
+            log_fn(f"    🔄 Excel ne répondait plus (fenêtre bloquante invisible ?) : instance tuée et "
+                   f"relancée, réussi ensuite", LOG_WARN)
         if r.get("bloque"):
             restants = [i for i in ids if i not in r["absents_src"]]
             stats["err"] += 1
@@ -208,13 +173,78 @@ def ranger_ids(root_sp, commune, dossier_src, ids, ppt_mode, supprimer, log_fn, 
             log_fn(f"    ⚠️ Absent(s) de l'Excel SharePoint (non ajoutés) : {', '.join(r['absents_dst'])}", LOG_WARN)
     except PermissionError:
         stats["err"] += 1
-        if excel_voulu: echec(ids, f"{nom_dst} verrouillé")
+        echec(ids, f"{nom_dst} verrouillé")
         log_fn(f"    ⚠️ {nom_dst} verrouillé (ouvert dans Excel ?)", LOG_WARN)
     except Exception as e:
         stats["err"] += 1
-        if excel_voulu: echec(ids, f"erreur Excel : {e}")
+        echec(ids, f"erreur Excel : {e}")
         log_fn(f"    ❌ Erreur Excel : {e}", LOG_ERR)
-    phase("excel", "ok" if stats["err"] == 0 else "err")
+    return donnees, ids_src
+
+
+def ranger_ids(root_sp, commune, dossier_src, ids, ppt_mode, supprimer, log_fn, phase_fn=None,
+               colonnes=None, maj_excel=None):
+    """Met à jour Dep/commune uniquement pour les ID erreur donnés.
+    ppt_mode : "remplacer", "modifier" ou None (Excel seul).
+    colonnes : colonnes Excel à mettre à jour (None = toutes, [] = aucune).
+    maj_excel : fonction (src, dst, ids, colonnes) → résultat ; par défaut réécriture du
+                fichier (maj_lignes_excel), ou SessionExcel.maj_lignes pour la co-édition.
+    Retourne un dict stats (dont "echecs" : {ID → raison}) ou None si erreur bloquante."""
+    def phase(n, e="run"):
+        if phase_fn: phase_fn(n, e)
+
+    def echec(liste, raison):
+        for i in liste:
+            stats["echecs"][i] = f"{stats['echecs'][i]} ; {raison}" if i in stats["echecs"] else raison
+
+    maj_excel = maj_excel or maj_lignes_excel
+    dep = get_dep(commune)
+    dossier_dst = os.path.join(root_sp, dep, commune)
+    ppt_dst = os.path.join(dossier_dst, PPT_FOLDER)
+    excel_dst = os.path.join(dossier_dst, f"{AUDIT_PREFIX}{commune}.xlsx")
+    nom_dst = os.path.basename(excel_dst)
+    stats = {"lignes": 0, "excel": 0, "ppt": 0, "err": 0, "echecs": {}}
+    # Aucune colonne cochée = PPT seuls : aucun des deux Excel n'est alors utilisé pour écrire.
+    # L'Excel Prod IA ne sert qu'en mode « modifier » (valeurs Remarque / Lien Street View).
+    excel_voulu = colonnes is None or bool(colonnes)
+    besoin_src = excel_voulu or ppt_mode == "modifier"
+
+    # 1. Vérifications
+    phase("verif", "run")
+    if not dossier_src or not os.path.isdir(dossier_src):
+        log_fn(f"  ❌ Aucun dossier {commune} dans Prod IA", LOG_ERR)
+        phase("verif", "err"); return None
+    if not os.path.isdir(dossier_dst):
+        log_fn(f"  ❌ Destination introuvable : {dep}/{commune}", LOG_ERR)
+        phase("verif", "err"); return None
+    if excel_voulu and not os.path.isfile(excel_dst):
+        log_fn(f"  ❌ Excel SharePoint introuvable : {dep}/{commune}/{nom_dst}", LOG_ERR)
+        phase("verif", "err"); return None
+    phase("verif", "ok")
+
+    # 2. Excel source
+    phase("analyse", "run")
+    excels = [f for f in os.listdir(dossier_src) if f.lower().endswith(".xlsx") and not f.startswith("~")]
+    nom_src = f"{AUDIT_PREFIX}{commune}.xlsx"
+    nom_src = nom_src if nom_src in excels else (excels[0] if excels else None)
+    excel_src = os.path.join(dossier_src, nom_src) if nom_src else None
+    if besoin_src and not nom_src:
+        log_fn(f"  ❌ Aucun Excel dans Prod IA/{commune}"
+               + ("" if excel_voulu else " (nécessaire pour modifier les PPT)"), LOG_ERR)
+        phase("analyse", "err"); return None
+    log_fn(f"  🔎 {len(ids)} ID erreur" + (f" · source {nom_src}" if besoin_src else " · PPT seuls"), LOG_INFO)
+    phase("analyse", "ok")
+
+    # 3. Excel : remplacement des seules lignes des ID
+    phase("excel", "run")
+    donnees, ids_src = None, []
+    if not excel_voulu:
+        log_fn("  ⏭️ Excel non modifié (aucune colonne cochée) : seuls les PPT sont traités", LOG_INFO)
+        phase("excel", "ok")
+    else:
+        donnees, ids_src = _etape_excel(maj_excel, excel_src, excel_dst, ids, colonnes, commune, dep,
+                                        nom_src, nom_dst, stats, echec, log_fn)
+        phase("excel", "ok" if stats["err"] == 0 else "err")
 
     # 4. PPT
     phase("ppt", "run")
@@ -273,17 +303,25 @@ def ranger_ids(root_sp, commune, dossier_src, ids, ppt_mode, supprimer, log_fn, 
         log_fn(f"  🖼️  {stats['ppt']} PPT {verbe} → {dep}/{commune}/{PPT_FOLDER}/", LOG_OK)
     phase("ppt", "ok" if stats["err"] == err_avant else "err")
 
-    # 5. Nettoyage : seulement si tout a réussi ET que le dossier ne contient
-    #    pas d'autres ID que ceux saisis (sinon on les perdrait)
+    # 5. Nettoyage : seulement si tout a réussi ET que le dossier ne contient pas de travail
+    #    d'autres ID que ceux saisis (sinon on le perdrait).
+    #    - Excel mis à jour : les autres ID sont ceux des lignes de l'Excel Prod IA.
+    #    - PPT seuls : l'Excel n'a servi à rien (ou seulement de lecture) et n'est pas un livrable
+    #      en attente ; seuls comptent les PPT d'autres ID présents dans le dossier.
     phase("nettoyage", "run")
-    autres = [i for i in ids_src if i not in set(ids)]
+    saisis = {i.upper() for i in ids}
+    if excel_voulu:
+        autres, quoi = [i for i in ids_src if i not in saisis], "ligne(s) Excel d'autres ID"
+    else:
+        autres, quoi = _autres_ppt(dossier_src, saisis), "PPT d'autres ID"
     if stats["err"]:
         log_fn(f"  ⚠️ {stats['err']} erreur(s) → dossier Prod IA/{commune} conservé", LOG_WARN)
         phase("nettoyage", "err")
     elif not supprimer:
         log_fn(f"  ⏭️ Suppression désactivée (dossier gardé)", LOG_INFO); phase("nettoyage", "ok")
     elif autres:
-        log_fn(f"  ⏭️ Prod IA/{commune} conservé : {len(autres)} autre(s) ID non traité(s)", LOG_INFO)
+        apercu = ", ".join(autres[:5]) + (" …" if len(autres) > 5 else "")
+        log_fn(f"  ⏭️ Prod IA/{commune} conservé : {len(autres)} {quoi} non traité(s) ({apercu})", LOG_INFO)
         phase("nettoyage", "ok")
     else:
         try:

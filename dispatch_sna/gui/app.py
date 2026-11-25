@@ -18,7 +18,7 @@ from ..services.constantes import COL_ID_ERR
 from ..services.dispatcher import ranger_commune, ranger_ids
 from ..services.error_ids import extraire_ids
 from ..services.excel_rows import lire_entetes
-from ..services.excel_com import SessionExcel, ExcelIndisponible, excel_disponible
+from ..services.excel_com import SessionExcelSurveillee, ExcelIndisponible, excel_disponible
 from .theme import (C_ACCENT, C_AMBER, C_BG, C_BORDER, C_BORDER2, C_CARD, C_CYAN, C_GREEN, C_MUTED,
                     C_PANEL, C_PANEL2, C_PURPLE, C_RED, C_TEXT, C_TEXT2, F_BODY, F_MONO, F_TITLE)
 
@@ -690,9 +690,12 @@ class App(tk.Tk):
             self._log(f"🔐 {ecriture_txt}", C_MUTED)
             self._log(f"🖼️  {ppt_txt}", C_MUTED)
             self._log("─"*50, C_MUTED)
-            session = (SessionExcel(visible=self.cfg.get("excel_visible", False),
-                                    delai_occupe_s=self.cfg.get("excel_delai_occupe_s", 120))
-                       if excel_com else nullcontext())
+            # Session surveillée : fil COM dédié + relance d'Excel s'il ne répond plus.
+            # PPT seuls (aucune colonne cochée) : Excel n'est pas lancé du tout.
+            session = (SessionExcelSurveillee(visible=self.cfg.get("excel_visible", False),
+                                              delai_occupe_s=self.cfg.get("excel_delai_occupe_s", 120),
+                                              delai_blocage_s=self.cfg.get("excel_delai_blocage_s", 120))
+                       if excel_com and colonnes else nullcontext())
             try:
                 with session as xl:
                     for i,commune in enumerate(codes,1):
