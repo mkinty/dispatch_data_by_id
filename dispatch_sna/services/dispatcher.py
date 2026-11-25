@@ -8,7 +8,10 @@ from .constantes import (AUDIT_PREFIX, PPT_FOLDER, PPT_PREFIX, COL_REMARQUE, COL
 from .chemins import get_dep, onedrive_pin, copier_remplacer
 from .error_ids import nom_ppt
 from .excel_rows import est_onglet_audit, maj_lignes_excel, lire_lignes, retirer_filtres_fichier
+from .fichiers_cloud import ErreurOneDrive
 from .ppt_editor import modifier_ppt, copier_ppt
+
+SEUIL_REFUS_ONEDRIVE = 3     # refus OneDrive consécutifs avant de reporter le reste de la commune
 
 
 # ── Traitement d'une commune ──────────────────────────────────────
@@ -257,7 +260,17 @@ def ranger_ids(root_sp, commune, dossier_src, ids, ppt_mode, supprimer, log_fn, 
             try: donnees = lire_lignes(excel_src, ids)
             except Exception as e:
                 donnees = {}; log_fn(f"    ❌ Lecture Excel Prod IA impossible : {e}", LOG_ERR)
-        for id_err in ids:
+        refus_onedrive = 0          # refus OneDrive consécutifs (malgré les réessais) : disjoncteur
+        a_liberer = []              # fichiers à libérer de l'espace local APRÈS la boucle
+        for n, id_err in enumerate(ids):
+            if refus_onedrive >= SEUIL_REFUS_ONEDRIVE:
+                reste = ids[n:]
+                stats["err"] += len(reste); stats["onedrive_ko"] = True
+                echec(reste, "reporté : OneDrive refuse les opérations sur ce dossier (voir journal)")
+                log_fn(f"    ⏸️ OneDrive a refusé {refus_onedrive} PPT de suite : les {len(reste)} suivants "
+                       "sont mis en attente sans être tentés (vérifiez que OneDrive est lancé, connecté, "
+                       "non suspendu, avec de l'espace disque)", LOG_WARN)
+                break
             nom = nom_ppt(id_err)
             src, dst = os.path.join(dossier_src, nom), os.path.join(ppt_dst, nom)
             try:
@@ -267,7 +280,8 @@ def ranger_ids(root_sp, commune, dossier_src, ids, ppt_mode, supprimer, log_fn, 
                         log_fn(f"    ⚠️ {nom} absent de Prod IA/{commune}", LOG_WARN); continue
                     if ppt_mode == "modifier":
                         log_fn(f"    ℹ️ {nom} absent de SharePoint → copie du nouveau PPT", LOG_INFO)
-                    copier_ppt(src, dst); onedrive_pin(dst); stats["ppt"] += 1
+                    copier_ppt(src, dst); a_liberer.append(dst); stats["ppt"] += 1
+                    refus_onedrive = 0
                     continue
                 d = donnees.get(id_err.upper())
                 if d is None:
@@ -291,14 +305,23 @@ def ranger_ids(root_sp, commune, dossier_src, ids, ppt_mode, supprimer, log_fn, 
                     log_fn(f"    ℹ️ {id_err} : « {', '.join(vides)} » vide et non cochée → zone du PPT laissée telle quelle", LOG_INFO)
                 if videes:
                     log_fn(f"    🧽 {nom} : zone vidée, « {', '.join(videes)} » vide dans Prod IA", LOG_INFO)
+                refus_onedrive = 0
                 if res["analyse"] or res["lien"]:
-                    onedrive_pin(dst); stats["ppt"] += 1
+                    a_liberer.append(dst); stats["ppt"] += 1
             except PermissionError:
                 stats["err"] += 1; echec([id_err], "PPT verrouillé")
                 log_fn(f"    ⚠️ {nom} verrouillé (ouvert dans PowerPoint ?)", LOG_WARN)
+            except ErreurOneDrive as e:
+                refus_onedrive += 1
+                stats["err"] += 1; echec([id_err], f"PPT : {e}")
+                log_fn(f"    ❌ {nom} : {e}", LOG_ERR)
             except Exception as e:
                 stats["err"] += 1; echec([id_err], f"PPT : {e}")
                 log_fn(f"    ❌ {nom} : {e}", LOG_ERR)
+        # Libération de l'espace local seulement une fois tous les PPT écrits : désépingler un
+        # fichier encore en cours d'envoi le rend « en ligne uniquement » au pire moment.
+        for f in a_liberer:
+            onedrive_pin(f)
         verbe = "remplacé(s)" if ppt_mode == "remplacer" else "modifié(s)"
         log_fn(f"  🖼️  {stats['ppt']} PPT {verbe} → {dep}/{commune}/{PPT_FOLDER}/", LOG_OK)
     phase("ppt", "ok" if stats["err"] == err_avant else "err")

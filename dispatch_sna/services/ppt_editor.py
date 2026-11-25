@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
+import io
 import zipfile
 from html import unescape
+
+from .fichiers_cloud import copier, lire_octets, remplacer
 
 _SHAPE = re.compile(r"<p:sp>.*?</p:sp>", re.S)
 _TXBODY = re.compile(r"(<p:txBody>)(.*?)(</p:txBody>)", re.S)
@@ -164,7 +166,8 @@ def modifier_ppt(chemin: str, analyse: str | None, lien: str | None) -> dict:
     """
     slide_re = re.compile(r"^ppt/slides/slide\d+\.xml$")
     nouveaux, res = {}, {"analyse": False, "lien": False}
-    with zipfile.ZipFile(chemin) as z:
+    contenu = lire_octets(chemin)                 # rapatrie un PPT « en ligne uniquement »
+    with zipfile.ZipFile(io.BytesIO(contenu)) as z:
         noms = z.namelist()
         for nom in sorted(n for n in noms if slide_re.match(n)):
             rel_nom = nom.replace("slides/", "slides/_rels/") + ".rels"
@@ -179,12 +182,12 @@ def modifier_ppt(chemin: str, analyse: str | None, lien: str | None) -> dict:
         return res
     tmp = chemin + ".tmp.pptx"
     try:
-        with zipfile.ZipFile(chemin) as zi, zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zo:
+        with zipfile.ZipFile(io.BytesIO(contenu)) as zi, zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zo:
             for item in zi.infolist():
                 data = nouveaux[item.filename].encode("utf-8") if item.filename in nouveaux \
                     else zi.read(item.filename)
                 zo.writestr(item, data)
-        os.replace(tmp, chemin)
+        remplacer(tmp, chemin)
     finally:
         if os.path.isfile(tmp):
             os.remove(tmp)
@@ -192,6 +195,5 @@ def modifier_ppt(chemin: str, analyse: str | None, lien: str | None) -> dict:
 
 
 def copier_ppt(src: str, dst: str):
-    tmp = dst + ".tmp"
-    shutil.copy2(src, tmp)
-    os.replace(tmp, dst)
+    """Remplace dst par src (contenu seul), robuste quand dst est « en ligne uniquement »."""
+    copier(src, dst)

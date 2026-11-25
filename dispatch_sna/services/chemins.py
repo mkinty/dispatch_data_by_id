@@ -5,6 +5,7 @@ import shutil
 
 from .constantes import DEP_PREFIX, AUDIT_PREFIX, COL_ID_ERR, LOG_WARN, LOG_ERR
 from .excel_rows import lire_entetes
+from .fichiers_cloud import copier
 
 
 def extraire_commune_nom(nom):
@@ -122,12 +123,7 @@ def detecter_colonnes(prod_ia, root_sp, essais=12, delai_s=45):
 def copier_remplacer(src, dst, log_fn):
     """Copie src → dst en remplaçant proprement. Retourne True si OK."""
     try:
-        # Écriture via un fichier temporaire pour éviter la corruption
-        tmp = dst + ".tmp"
-        shutil.copy2(src, tmp)
-        if os.path.isfile(dst):
-            os.remove(dst)
-        shutil.move(tmp, dst)
+        copier(src, dst)                  # fichier temporaire + remplacement robuste OneDrive
         onedrive_pin(dst)
         return True
     except PermissionError:

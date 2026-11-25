@@ -127,6 +127,28 @@ PPT ont été traités sans erreur, même s'il contient l'Excel. Seul cas où il
 conservé : il contient des PPT d'autres ID, non saisis, qui ne sont pas encore
 livrés.
 
+**Refus OneDrive (« [WinError 389] L'opération de cloud a échoué »)** : les PPT
+déjà livrés sont « disponibles en ligne uniquement », car l'outil les désépingle
+pour libérer de la place. OneDrive refuse souvent de *renommer par-dessus* un tel
+fichier. Toutes les lectures et écritures passent donc par
+`services/fichiers_cloud.py` :
+- les erreurs cloud passagères sont réessayées (pauses de 1, 3, 8 puis 15 s) ;
+- seuls les octets sont copiés, jamais les attributs du fichier source (lecture
+  seule, attributs OneDrive) ;
+- le remplacement se fait en trois temps : remplacement direct ; sinon
+  rapatriement de l'ancien fichier puis remplacement ; sinon suppression puis
+  dépôt, avec remise en place de l'ancien fichier si le dépôt échoue. La
+  destination n'est jamais laissée vide ;
+- la taille écrite est vérifiée, et l'erreur finale nomme l'étape en cause.
+
+**Disjoncteurs** :
+- **par commune** : 3 refus OneDrive d'affilée → les PPT restants sont mis en
+  attente sans être tentés ;
+- **par lot** : 3 communes d'affilée dans ce cas → pause de 60 s, puis arrêt du
+  lot si cela continue. Les communes restantes passent dans « ID en attente ».
+
+La libération d'espace (désépinglage) est faite après tous les PPT de la commune.
+
 **Filtres et colonnes masquées** : à chaque mise à jour par ID, dans l'onglet
 `Audit` uniquement, l'outil retire les critères de filtre (tableaux Excel
 compris) et réaffiche les lignes et colonnes masquées, côté Prod IA comme côté

@@ -5,11 +5,19 @@ import os
 from copy import copy
 from dataclasses import dataclass
 
-from openpyxl import load_workbook
+import io
+
+from openpyxl import load_workbook as _load_workbook
 from openpyxl.formula.translate import Translator
 from openpyxl.utils import column_index_from_string, get_column_letter
 
 from .constantes import ONGLET_AUDIT, COL_ID_ERR, COL_REMARQUE, COL_LIEN_SV
+from .fichiers_cloud import lire_octets, remplacer
+
+
+def load_workbook(chemin, **kw):
+    """openpyxl.load_workbook sur le contenu du fichier, lu de façon robuste (OneDrive)."""
+    return _load_workbook(io.BytesIO(lire_octets(chemin)), **kw)
 
 
 def _norm(v) -> str:
@@ -114,7 +122,7 @@ def _enregistrer(wb, chemin: str):
     tmp = chemin + ".tmp.xlsx"
     try:
         wb.save(tmp)
-        os.replace(tmp, chemin)
+        remplacer(tmp, chemin)
     finally:
         if os.path.isfile(tmp):
             os.remove(tmp)

@@ -22,6 +22,22 @@ from ..services.excel_com import SessionExcelSurveillee, ExcelIndisponible, exce
 from .theme import (C_ACCENT, C_AMBER, C_BG, C_BORDER, C_BORDER2, C_CARD, C_CYAN, C_GREEN, C_MUTED,
                     C_PANEL, C_PANEL2, C_PURPLE, C_RED, C_TEXT, C_TEXT2, F_BODY, F_MONO, F_TITLE)
 
+class _EtatPartage(dict):
+    """État partagé fil de travail → interface. Les mises à jour de lignes du tableau
+    (row_insert / row_update) sont mises en FILE au lieu d'écraser la précédente : sinon,
+    quand plusieurs communes passent entre deux rafraîchissements (250 ms), leurs lignes
+    disparaissaient du tableau."""
+
+    def __setitem__(self, cle, valeur):
+        if cle in ("row_insert", "row_update"):
+            self.setdefault("_lignes", []).append((cle, valeur))
+        else:
+            super().__setitem__(cle, valeur)
+
+
+SEUIL_COMMUNES_ONEDRIVE_KO = 3   # communes consécutives refusées par OneDrive avant pause, puis arrêt du lot
+PAUSE_ONEDRIVE_S = 60
+
 PHASES = [("verif","Vérif dest."),("analyse","Analyse"),("excel","Excel"),
           ("ppt","PPT"),("nettoyage","Nettoyage")]
 
@@ -38,7 +54,7 @@ class App(tk.Tk):
         self._debug_visible = False
         self._t_start = None
         self._logq = []
-        self._state = {}
+        self._state = _EtatPartage()
         self._running = False
         self._build_styles()
         self._build_ui()
@@ -501,21 +517,24 @@ class App(tk.Tk):
             key, etat = st["phase"]; self._set_phase_ui(key, etat); st.pop("phase", None)
         if "gpos" in st and "gmax" in st:
             self.progress.config(maximum=st["gmax"], value=st["gpos"])
-        if st.get("row_insert"):
-            commune = st.pop("row_insert")
-            self._reset_timeline_ui()
-            iid = f"row_{commune}"
-            if not self.tree.exists(iid):
-                self.tree.insert("","end", iid=iid, values=(commune,"","","","","","","🔄 En cours"), tags=("run",))
-                self.tree.tag_configure("run", foreground=C_AMBER)
-        if st.get("row_update"):
-            vals, ok = st.pop("row_update")
-            iid = f"row_{vals[0]}"
-            if self.tree.exists(iid):
-                tag = "ok" if ok else "err"
-                self.tree.item(iid, values=vals, tags=(tag,))
-                self.tree.tag_configure("ok", foreground=C_GREEN)
-                self.tree.tag_configure("err", foreground=C_RED)
+        lignes = st.get("_lignes") or []
+        while lignes:                            # dans l'ordre, sans en perdre (cf. _EtatPartage)
+            cle, valeur = lignes.pop(0)
+            if cle == "row_insert":
+                commune = valeur
+                self._reset_timeline_ui()
+                iid = f"row_{commune}"
+                if not self.tree.exists(iid):
+                    self.tree.insert("","end", iid=iid, values=(commune,"","","","","","","🔄 En cours"), tags=("run",))
+                    self.tree.tag_configure("run", foreground=C_AMBER)
+            else:
+                vals, ok = valeur
+                iid = f"row_{vals[0]}"
+                if self.tree.exists(iid):
+                    tag = "ok" if ok else "err"
+                    self.tree.item(iid, values=vals, tags=(tag,))
+                    self.tree.tag_configure("ok", foreground=C_GREEN)
+                    self.tree.tag_configure("err", foreground=C_RED)
         if "stats" in st:
             for k,v in st["stats"].items():
                 if k in self._stat_vars: self._stat_vars[k].set(str(v))
@@ -648,6 +667,15 @@ class App(tk.Tk):
                    "modifier":  "PPT → Analyse et Lien Street View modifiés (colonnes Remarque / Lien Street View)",
                    None:        "PPT → non traités"}[ppt_mode]
         colonnes = self._colonnes_maj()
+        if colonnes is None and ppt_mode is not None:
+            # Les PPT n'ont pas besoin des colonnes : on peut les traiter sans toucher à l'Excel
+            if not messagebox.askyesno("Colonnes non détectées",
+                    "Les colonnes Excel n'ont pas pu être détectées.\n\n"
+                    "Traiter uniquement les PPT (aucun Excel ne sera modifié) ?\n\n"
+                    "Pour mettre aussi l'Excel à jour, répondez Non puis cliquez sur 🔍 Détecter "
+                    "ou 📂 Choisir un fichier…"):
+                return
+            colonnes = []
         if colonnes is None:
             # Jamais « toutes les colonnes » à l'aveugle : une valeur vide efface l'ancienne
             messagebox.showwarning("Colonnes non détectées",
@@ -697,12 +725,22 @@ class App(tk.Tk):
                                               delai_blocage_s=self.cfg.get("excel_delai_blocage_s", 120))
                        if excel_com and colonnes else nullcontext())
             try:
+                # Disjoncteur du lot : si OneDrive bloque plusieurs communes d'affilée, une pause,
+                # puis arrêt du lot (les communes restantes passent en attente) plutôt que
+                # d'enchaîner des centaines d'échecs.
+                ko_suite, pause_faite, interrompu = 0, False, False
                 with session as xl:
                     for i,commune in enumerate(codes,1):
                         ids = groupes[commune]; dep = get_dep(commune)
                         self._state["gpos"]=i-1
                         self._state["prog"]=f"Commune {i}/{len(codes)} — {commune} ({len(ids)} ID)"
                         self._state["row_insert"]=commune
+                        if interrompu:
+                            echecs.update({x: "lot interrompu : OneDrive refusait les opérations, rejouez plus tard"
+                                           for x in ids})
+                            self._state["row_update"] = ((commune,dep,len(ids),"","","","","⏸️ Reporté"), False)
+                            self._state["gpos"]=i; self._state["stats"]=dict(tot)
+                            continue
                         self._log(f"\n📍 Commune {commune}  ({i}/{len(codes)}) — {', '.join(ids)}", C_AMBER)
                         stats = ranger_ids(root_sp, commune, dispo.get(commune), ids, ppt_mode,
                                            supprimer, self._log, phase_fn=self._cb_phase, colonnes=colonnes,
@@ -716,6 +754,8 @@ class App(tk.Tk):
                             ok = stats["err"]==0
                             if any("mode exclusif" in r for r in stats["echecs"].values()):
                                 statut = "🔒 Verrouillé"
+                            elif stats.get("onedrive_ko"):
+                                statut = "☁️ Refus OneDrive"
                             else:
                                 statut = "✅ Mis à jour" if ok else f"⚠️ {stats['err']} erreur(s)"
                             self._state["row_update"] = ((commune,dep,len(ids),stats["excel"],stats["lignes"],
@@ -725,6 +765,23 @@ class App(tk.Tk):
                             echecs.update({x: "commune non traitée (voir journal)" for x in ids})
                             self._state["row_update"] = ((commune,dep,len(ids),"","","","","❌ Non traité"), False)
                         self._state["stats"]=dict(tot)
+                        if stats is not None and stats.get("onedrive_ko"):
+                            ko_suite += 1
+                        elif stats is not None:
+                            ko_suite = 0
+                        if ko_suite >= SEUIL_COMMUNES_ONEDRIVE_KO:
+                            ko_suite = 0
+                            if not pause_faite:
+                                pause_faite = True
+                                self._log(f"\n⏸️ OneDrive a refusé les PPT de {SEUIL_COMMUNES_ONEDRIVE_KO} communes "
+                                          f"de suite : pause de {PAUSE_ONEDRIVE_S} s pour le laisser se rétablir…", C_AMBER)
+                                _time.sleep(PAUSE_ONEDRIVE_S)
+                            else:
+                                interrompu = True
+                                self._log(f"\n⛔ OneDrive refuse toujours les opérations : lot interrompu. Les "
+                                          f"{len(codes) - i} commune(s) restantes passent en attente. Vérifiez OneDrive "
+                                          "(lancé, connecté, non suspendu, espace disque) puis « Charger les ID en "
+                                          "attente ».", C_RED)
             except ExcelIndisponible as e:
                 tot["err"]+=1
                 echecs.update({x: f"Excel indisponible : {e}" for c in codes for x in groupes[c] if x not in reussis})
@@ -763,7 +820,7 @@ class App(tk.Tk):
         self.progress.config(style="green.Horizontal.TProgressbar")
         self.progress["value"]=0; self.progress["maximum"]=n
         self._t_start=_time.time(); self._tick()
-        self._logq=[]; self._state={"gmax":n,"gpos":0}; self._running=True
+        self._logq=[]; self._state=_EtatPartage(gmax=n, gpos=0); self._running=True
         self.after(250, self._poll)
 
     def _supprimer_adeposer(self, prod_ia):
