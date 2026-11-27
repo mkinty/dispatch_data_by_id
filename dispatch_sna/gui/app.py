@@ -13,14 +13,30 @@ from contextlib import nullcontext
 
 from ..config import load_config, save_config, ATTENTE_FILE, RAPPORTS_DIR
 from ..services import attente
-from ..services.chemins import get_dep, lister_communes_prod, detecter_colonnes, supprimer_si_vide
-from ..services.constantes import COL_ID_ERR
+from ..services.chemins import calculer_apercu, get_dep
+from ..services.constantes import COL_ID_ERR, COL_ID_IMM
 from ..services.dispatcher import ranger_commune, ranger_ids
-from ..services.error_ids import extraire_ids
+from ..services.ecriture import SessionEcriture
+from ..services.error_ids import extraire_ids, extraire_ids_imm
 from ..services.excel_rows import lire_entetes
 from ..services.excel_com import SessionExcelSurveillee, ExcelIndisponible, excel_disponible
+from ..services.ppt_com import PowerPointALaDemande
+from ..services.sharepoint import connexion as sp_cx, rest as sp_rest
+from ..services.sharepoint.navigateur import NavigateurFerme, NavigateurIndisponible
+from ..services.sharepoint.sources import Sources, detecter_colonnes as detecter_colonnes_sources
 from .theme import (C_ACCENT, C_AMBER, C_BG, C_BORDER, C_BORDER2, C_CARD, C_CYAN, C_GREEN, C_MUTED,
                     C_PANEL, C_PANEL2, C_PURPLE, C_RED, C_TEXT, C_TEXT2, F_BODY, F_MONO, F_TITLE)
+
+def _ouvert_ailleurs(raison: str) -> bool:
+    """ID refusé parce que son fichier est ouvert par quelqu'un (à retenter), pas extrait ni en erreur."""
+    r = (raison or "").lower()
+    return ("verrouillé" in r or "ouvert par" in r) and "extrait" not in r and "interrompu" not in r
+
+
+def sp_cx_message_session(e):
+    return (f"session SharePoint expirée ou refusée ({e}) — cliquez sur « 🔗 Se connecter à SharePoint » "
+            "puis « Charger les ID en attente »")
+
 
 class _EtatPartage(dict):
     """État partagé fil de travail → interface. Les mises à jour de lignes du tableau
@@ -43,11 +59,16 @@ def _apercu(elements, n=8):
 def _statut_bloquant(raison):
     """Libellé court du tableau pour une commune qui n'a pas pu être traitée."""
     for motif, libelle in (("dans Prod IA", "❌ Absent de Prod IA"), ("dossier SharePoint", "❌ Dest. absente"),
-                           ("Excel SharePoint", "❌ Excel SP absent"), ("aucun Excel", "❌ Excel Prod IA absent")):
+                           ("Excel SharePoint", "❌ Excel SP absent"), ("aucun Excel", "❌ Excel Prod IA absent"),
+                           ("session SharePoint", "🔑 Session expirée"), ("téléchargement interdit", "⛔ Accès refusé"),
+                           ("SharePoint :", "❌ SharePoint")):
         if motif in raison:
             return libelle
     return "❌ Non traité"
 
+
+LIGNES_PAR_TOUR = 300        # lignes de journal affichées par rafraîchissement (250 ms)
+LIGNES_MAX_JOURNAL = 6000    # lignes gardées dans la zone de journal (le fichier garde tout)
 
 SEUIL_COMMUNES_ONEDRIVE_KO = 3   # communes consécutives refusées par OneDrive avant pause, puis arrêt du lot
 PAUSE_ONEDRIVE_S = 60
@@ -68,6 +89,9 @@ class App(tk.Tk):
         self._debug_visible = False
         self._t_start = None
         self._logq = []
+        self._journal, self._journal_chemin = None, None
+        self._journal_verrou = threading.Lock()
+        self._tags_log = set()
         self._state = _EtatPartage()
         self._running = False
         self._build_styles()
@@ -143,9 +167,28 @@ class App(tk.Tk):
         tk.Frame(root, bg=C_BG, height=14).pack(fill="x")
 
         # CONFIG
-        cfg = self._card(root, "Configuration", "⚙️", C_ACCENT, "Chemins — sauvegardés automatiquement")
-        self._path_row(cfg, "Racine SharePoint", "root_sp", True, "Dossier audit_SNA (contient DepXX)")
-        self._path_row(cfg, "Dossier À déposer", "prod_ia", True, "Prod IA/À déposer — dossiers commune de Babayaga")
+        cfg = self._card(root, "Configuration", "⚙️", C_ACCENT,
+                         "Chemins — dossier local (OneDrive) OU lien SharePoint https://… — sauvegardés automatiquement")
+        self._path_row(cfg, "Racine SharePoint", "root_sp", True,
+                       "Dossier audit_SNA (contient DepXX) — ou son lien SharePoint (copiez la barre d'adresse du dossier)")
+        self._path_row(cfg, "Dossier À déposer", "prod_ia", True,
+                       "Prod IA/À déposer — dossiers commune de Babayaga — ou son lien SharePoint")
+        # Connexion SharePoint (sources par lien) : même processus que audit_validation_finale
+        sprow = tk.Frame(cfg, bg=C_CARD); sprow.pack(fill="x", pady=(6,0))
+        self.btn_sp_connecter = tk.Button(sprow, text="🔗 Se connecter à SharePoint", command=self._connecter_sp,
+                                          bg=C_ACCENT, fg="white", font=(F_BODY,9,"bold"), relief="flat",
+                                          cursor="hand2", padx=12, pady=3)
+        self.btn_sp_connecter.pack(side="left")
+        self.btn_sp_oublier = tk.Button(sprow, text="🚪 Oublier la connexion", command=self._oublier_sp,
+                                        bg=C_PANEL2, fg=C_TEXT2, font=(F_BODY,8), relief="flat", cursor="hand2",
+                                        padx=10, pady=3)
+        self.btn_sp_oublier.pack(side="left", padx=(6,0))
+        self.lbl_sp = tk.Label(sprow, text="", bg=C_CARD, fg=C_MUTED, font=(F_BODY,8), justify="left",
+                               wraplength=640, anchor="w")
+        self.lbl_sp.pack(side="left", padx=(10,0), fill="x", expand=True)
+        self._sp_en_cours = False
+        self._chemins_vus = (self.ent_root_sp.get().strip(), self.ent_prod_ia.get().strip())
+        self._maj_sp_ui()
         opt = tk.Frame(cfg, bg=C_CARD); opt.pack(fill="x", pady=(8,0))
         self.var_supp = tk.BooleanVar(value=bool(self.cfg.get("supprimer", True)))
         self._check(opt, "🗑️ Supprimer le dossier de Prod IA après rangement", self.var_supp, self._save_cfg)
@@ -165,19 +208,19 @@ class App(tk.Tk):
 
         # ACTION
         act = self._card(root, "Rangement", "📦", C_GREEN,
-                         "Commune complète : Prod IA → Dep/commune · ID erreur : seules les lignes / PPT des ID collés")
+                         "Commune complète : Prod IA → Dep/commune · ID imm : seules les lignes / PPT des ID collés")
         mrow = tk.Frame(act, bg=C_CARD); mrow.pack(fill="x", pady=(0,4))
         tk.Label(mrow, text="Ranger par :", bg=C_CARD, fg=C_MUTED, font=(F_BODY,9,"bold")).pack(side="left", padx=(0,8))
         self.var_mode = tk.StringVar(value=self.cfg.get("mode", "commune"))
-        for txt,val in [("Commune complète (tout Prod IA)","commune"),("ID erreur (lignes ciblées)","ids")]:
+        for txt,val in [("Commune complète (tout Prod IA)","commune"),("ID imm (lignes ciblées)","ids")]:
             tk.Radiobutton(mrow, text=txt, value=val, variable=self.var_mode, command=self._on_mode,
                            bg=C_CARD, fg=C_TEXT2, selectcolor=C_PANEL2, activebackground=C_CARD,
                            activeforeground=C_TEXT, font=(F_BODY,10), relief="flat",
                            cursor="hand2").pack(side="left", padx=(0,16))
 
-        # Saisie des ID erreur (mode ids uniquement)
+        # Saisie des ID imm (mode ids uniquement)
         self.frm_ids = tk.Frame(act, bg=C_CARD)
-        tk.Label(self.frm_ids, text="Collez vos ID erreur, un par ligne (ex : 74143_1, 74143_2) :",
+        tk.Label(self.frm_ids, text="Collez vos ID imm, un par ligne (ex : ID-3806800000IW) — chacun désigne une ligne du fichier audit :",
                  bg=C_CARD, fg=C_TEXT2, font=(F_BODY,9)).pack(anchor="w")
         ids_box = tk.Frame(self.frm_ids, bg="#060a12", highlightthickness=1,
                            highlightbackground=C_BORDER2, highlightcolor=C_ACCENT)
@@ -189,7 +232,7 @@ class App(tk.Tk):
         self.txt_ids.bind("<FocusIn>", lambda e: ids_box.config(highlightbackground=C_ACCENT))
         self.txt_ids.bind("<FocusOut>", lambda e: ids_box.config(highlightbackground=C_BORDER2))
         # Tk n'a pas de placeholder natif : label superposé, masqué dès que du texte est saisi
-        self.lbl_ids_ph = tk.Label(ids_box, text="74143_1\n74143_2\n38068_207", bg="#060a12", fg=C_MUTED,
+        self.lbl_ids_ph = tk.Label(ids_box, text="ID-3806800000IW\nID-3806800000IV\nID-2B030000006D", bg="#060a12", fg=C_MUTED,
                                    font=(F_MONO,10), justify="left", cursor="xterm")
         self.lbl_ids_ph.bind("<Button-1>", lambda e: self.txt_ids.focus_set())
         self.lbl_ids_ph.place(x=9, y=7)
@@ -227,8 +270,9 @@ class App(tk.Tk):
         erow = tk.Frame(self.frm_ids, bg=C_CARD); erow.pack(fill="x", pady=(8,0))
         self.var_excel_com = tk.BooleanVar(value=bool(self.cfg.get("excel_com", True)) and self._excel_ok)
         cb = self._check(erow, "🔐 Écrire via Excel (co-édition SharePoint)", self.var_excel_com, self._save_cfg)
-        aide = ("modifications appliquées même si un collègue a le fichier ouvert, valeurs vérifiées après "
-                "enregistrement · décoché : réécriture du fichier (perdue si le fichier est ouvert ailleurs)")
+        aide = ("coché : Excel pour chaque fichier, en co-édition, valeurs vérifiées après enregistrement · "
+                "décoché : Excel quand même pour un fichier synchronisé SharePoint ou ouvert (jamais écrasé), "
+                "réécriture directe d'un fichier local libre")
         if not self._excel_ok:
             cb.config(state="disabled")
             aide = "indisponible : Excel ou pywin32 absent → réécriture du fichier"
@@ -285,6 +329,8 @@ class App(tk.Tk):
         tk.Frame(root, bg=C_BG, height=16).pack(fill="x")
         self.after(300, self._preview)
         self.after(400, self._detect_cols)
+        if self._liens():
+            self.after(500, lambda: self._connecter_sp(interactif=False))
 
     def _path_row(self, parent, label, key, is_dir, hint=""):
         row = tk.Frame(parent, bg=C_CARD); row.pack(fill="x", pady=5)
@@ -298,11 +344,93 @@ class App(tk.Tk):
             p = filedialog.askdirectory() if is_dir else filedialog.askopenfilename()
             if p:
                 ent.delete(0,tk.END); ent.insert(0,p); self.cfg[key]=p; save_config(self.cfg)
-                self._preview(); self._detect_cols()
+                self._on_chemins()
         tk.Button(top, text="📁", width=3, command=browse, bg=C_PANEL2, fg=C_TEXT2, relief="flat",
                   cursor="hand2").pack(side="left")
         if hint: tk.Label(row, text="  "+hint, bg=C_CARD, fg=C_MUTED, font=(F_BODY,8)).pack(anchor="w")
+        # Lien collé ou chemin tapé : pris en compte en quittant le champ ou avec Entrée
+        ent.bind("<FocusOut>", lambda e: self._on_chemins())
+        ent.bind("<Return>", lambda e: self._on_chemins())
         setattr(self, f"ent_{key}", ent)
+
+    # ── Sources SharePoint par lien ──
+    def _chemins(self):
+        return self.ent_prod_ia.get().strip(), self.ent_root_sp.get().strip()
+    def _liens(self):
+        return [t for t in self._chemins() if sp_cx.est_lien(t)]
+    def _on_chemins(self):
+        vus = (self.ent_root_sp.get().strip(), self.ent_prod_ia.get().strip())
+        if vus == getattr(self, "_chemins_vus", None): return
+        self._chemins_vus = vus
+        self._save_cfg(); self._maj_sp_ui(); self._preview(); self._detect_cols()
+    def _maj_sp_ui(self, texte=None, couleur=None):
+        if not hasattr(self, "lbl_sp"): return
+        liens = self._liens()
+        actif = "disabled" if self._sp_en_cours else "normal"
+        self.btn_sp_connecter.config(state=actif if liens else "disabled")
+        self.btn_sp_oublier.config(state=actif)
+        if texte is not None:
+            return self.lbl_sp.config(text=texte, fg=couleur or C_AMBER)
+        if not liens:
+            return self.lbl_sp.config(text="Sources locales (dossiers OneDrive) : connexion SharePoint inutile",
+                                      fg=C_MUTED)
+        try:
+            hotes = sorted({sp_cx.analyser_lien(t).hote for t in liens})
+        except sp_cx.LienInvalide as e:
+            self.btn_sp_connecter.config(state="disabled")
+            return self.lbl_sp.config(text=f"⚠️ Lien SharePoint invalide : {e}", fg=C_RED)
+        if all(sp_cx.est_connecte(t) for t in liens):
+            self.lbl_sp.config(text=f"✅ Connecté à SharePoint ({', '.join(hotes)}) avec votre compte — "
+                                    "lecture et écriture par l'API, sans OneDrive", fg=C_GREEN)
+        else:
+            self.lbl_sp.config(text="🔑 Lien SharePoint : connexion requise → « 🔗 Se connecter » (une fenêtre "
+                                    "Edge s'ouvre pour vous identifier avec votre compte professionnel)", fg=C_AMBER)
+    def _connecter_sp(self, interactif=True):
+        """Connexion par le navigateur, en tâche de fond (jusqu'à 5 min d'identification)."""
+        liens = self._liens()
+        if not liens or self._sp_en_cours: return
+        if interactif and not sp_cx.navigateur_disponible():
+            return messagebox.showwarning("SharePoint", "Microsoft Edge ou Google Chrome est nécessaire pour "
+                                          "se connecter à SharePoint, et n'a pas été trouvé sur ce poste.")
+        self._sp_en_cours = True
+        boite = {"etape": "connexion à SharePoint…"}
+
+        def connecter():
+            try:
+                for t in liens:
+                    sp_cx.connecter_navigateur(t, on_etape=lambda m: boite.update(etape=m), interactif=interactif)
+                boite["ok"] = True
+            except Exception as e:
+                boite["e"] = e
+        threading.Thread(target=connecter, daemon=True).start()
+
+        def attendre():
+            if "ok" not in boite and "e" not in boite:
+                if interactif: self._maj_sp_ui(f"⏳ {boite['etape']}", C_ACCENT)
+                self.after(250, attendre); return
+            self._sp_en_cours = False
+            e = boite.get("e")
+            if e is None:
+                self._maj_sp_ui(); self._chemins_vus = None; self._on_chemins()
+                return
+            if not interactif:          # au démarrage : silencieux, l'utilisateur cliquera
+                return self._maj_sp_ui()
+            if isinstance(e, NavigateurFerme):
+                msg = "fenêtre fermée avant la fin de l'identification — recliquez sur « 🔗 Se connecter »"
+            elif isinstance(e, NavigateurIndisponible):
+                msg = f"navigateur indisponible : {e}"
+            else:
+                msg = str(e)
+            self._maj_sp_ui(f"❌ Connexion SharePoint impossible : {msg}", C_RED)
+            if isinstance(e, sp_rest.TelechargementInterdit):
+                messagebox.showwarning("SharePoint", sp_rest.TelechargementInterdit.EXPLICATION)
+        self.after(250, attendre)
+    def _oublier_sp(self):
+        if not messagebox.askyesno("SharePoint", "Oublier la connexion SharePoint de l'outil ?\n\n"
+                                   "La session du navigateur dédié est effacée : il faudra vous identifier "
+                                   "à nouveau. Votre navigateur habituel n'est pas concerné."):
+            return
+        sp_cx.oublier_connexion(); self._maj_sp_ui(); self._preview()
 
     def _check(self, parent, text, var, command):
         cb = tk.Checkbutton(parent, text=f"  {text}", variable=var, bg=C_CARD, fg=C_TEXT2, selectcolor=C_PANEL2,
@@ -311,11 +439,11 @@ class App(tk.Tk):
         cb.pack(side="left", padx=(0,12))
         return cb
 
-    # ── Mode ID erreur ──
+    # ── Mode ID imm ──
     def _by_ids(self):
         return self.var_mode.get() == "ids"
     def _ids(self):
-        return extraire_ids(self.txt_ids.get("1.0", "end"))
+        return extraire_ids_imm(self.txt_ids.get("1.0", "end"))
     def _ppt_mode(self):
         if self.var_ppt_rempl.get(): return "remplacer"
         if self.var_ppt_modif.get(): return "modifier"
@@ -323,7 +451,7 @@ class App(tk.Tk):
     def _on_mode(self, preview=True):
         if self._by_ids():
             self.frm_ids.pack(fill="x", pady=(4,0), before=self.btn_run)
-            self.btn_run.config(text="🎯  Mettre à jour les ID erreur")
+            self.btn_run.config(text="🎯  Mettre à jour les ID imm")
         else:
             self.frm_ids.pack_forget()
             self.btn_run.config(text="📦  Ranger tout Prod IA")
@@ -345,11 +473,18 @@ class App(tk.Tk):
     def _charger_attente(self):
         d = attente.charger(ATTENTE_FILE)
         if not d: return self._maj_attente_ui()
-        self.txt_ids.delete("1.0", "end"); self.txt_ids.insert("1.0", "\n".join(d))
-        detail = "\n".join(f"• {i} : {v.get('raison','')} ({v.get('date','')})" for i, v in list(d.items())[:15])
-        plus = f"\n… et {len(d)-15} autre(s)" if len(d) > 15 else ""
-        messagebox.showinfo("ID en attente", f"{len(d)} ID chargé(s) dans la zone de saisie.\n\n{detail}{plus}\n\n"
-                            "Cliquez sur « Mettre à jour les ID erreur » pour les rejouer : ceux qui réussissent "
+        # Entrées de l'ancienne version (ID erreur) : non rejouables, la mise à jour se fait par ID imm
+        imm = {i: v for i, v in d.items() if str(i).upper().startswith("ID-")}
+        anciens = len(d) - len(imm)
+        self.txt_ids.delete("1.0", "end"); self.txt_ids.insert("1.0", "\n".join(imm))
+        detail = "\n".join(f"• {i} : {v.get('raison','')} ({v.get('date','')})" for i, v in list(imm.items())[:15])
+        plus = f"\n… et {len(imm)-15} autre(s)" if len(imm) > 15 else ""
+        ancien_txt = (f"\n\n⚠️ {anciens} entrée(s) de l'ancienne version, au format ID erreur, n'ont pas été "
+                      "chargées : la mise à jour se fait désormais par ID imm. Rechargez leurs ID imm, ou "
+                      "videz la liste." if anciens else "")
+        messagebox.showinfo("ID en attente", f"{len(imm)} ID imm chargé(s) dans la zone de saisie.\n\n"
+                            f"{detail}{plus}{ancien_txt}\n\n"
+                            "Cliquez sur « Mettre à jour les ID imm » pour les rejouer : ceux qui réussissent "
                             "sont retirés de la liste.")
     def _vider_attente(self):
         if messagebox.askyesno("ID en attente", "Vider la liste des ID en attente ?\n"
@@ -363,7 +498,7 @@ class App(tk.Tk):
         prod, root = self.ent_prod_ia.get().strip(), self.ent_root_sp.get().strip()
         self.lbl_cols.config(text="  🔍 Détection des colonnes…", fg=C_AMBER)
         res = {}
-        threading.Thread(target=lambda: res.update(r=detecter_colonnes(prod, root)), daemon=True).start()
+        threading.Thread(target=lambda: res.update(r=detecter_colonnes_sources(prod, root)), daemon=True).start()
         def attendre():
             if "r" not in res: self.after(200, attendre); return
             self._afficher_cols(*res["r"])
@@ -371,21 +506,22 @@ class App(tk.Tk):
     def _choisir_fichier_cols(self):
         """Repli manuel : lire les colonnes d'un Excel audit choisi par l'utilisateur."""
         f = filedialog.askopenfilename(title="Excel audit dont lire les colonnes",
-                                       initialdir=self.ent_prod_ia.get().strip() or None,
+                                       initialdir=(None if sp_cx.est_lien(self.ent_prod_ia.get())
+                                                   else self.ent_prod_ia.get().strip() or None),
                                        filetypes=[("Excel", "*.xlsx")])
         if not f: return
         try:
             cols = lire_entetes(f)
         except Exception as e:
             return self._afficher_cols([], None, [f"✗ {os.path.basename(f)} : {e}"])
-        if COL_ID_ERR not in cols:
-            return self._afficher_cols([], None, [f"✗ {os.path.basename(f)} : pas de colonne « {COL_ID_ERR} » "
+        if COL_ID_IMM not in cols and COL_ID_ERR not in cols:
+            return self._afficher_cols([], None, [f"✗ {os.path.basename(f)} : pas de colonne « {COL_ID_IMM} » "
                                                   "en ligne 1 de l'onglet Audit"])
         self._afficher_cols(cols, f, [])
     def _afficher_cols(self, cols, fichier, rapport=()):
         for w in self.frm_cols.winfo_children(): w.destroy()
         self._col_vars = {}
-        cols = [c for c in cols if c != COL_ID_ERR]   # clé de correspondance, jamais modifiée
+        cols = [c for c in cols if c not in (COL_ID_IMM, COL_ID_ERR)]   # identifiants, jamais modifiés
         if not cols:
             self.lbl_cols.config(fg=C_AMBER, text="  ⚠️ Colonnes non détectées :\n    "
                                  + "\n    ".join(rapport or ["aucun fichier lisible"])
@@ -411,8 +547,9 @@ class App(tk.Tk):
         k = sum(v.get() for v in self._col_vars.values())
         self.lbl_cols.config(fg=C_ACCENT if k else C_AMBER,
             text=f"  {k}/{len(self._col_vars)} colonne(s) cochée(s) · détectées depuis "
-                 f"{os.path.basename(self._cols_src)}" + ("" if k else " — l'Excel ne sera pas modifié")
-                 + " · (« ID erreur » sert à retrouver les lignes. Les PPT lisent toujours "
+                 f"{os.path.basename(self._cols_src.split('?')[0]).replace('%20', ' ')}"
+                 + ("" if k else " — l'Excel ne sera pas modifié")
+                 + " · (« ID imm » sert à retrouver les lignes, « ID erreur » à nommer les PPT. Les PPT lisent toujours "
                    "« Remarque » et « Lien Street View » de Prod IA)")
         self._save_cfg()
     def _colonnes_maj(self):
@@ -443,8 +580,31 @@ class App(tk.Tk):
     def _show_debug(self):
         if not self._debug_visible: self._toggle_debug()
     def _log(self, msg, color=C_GREEN):
+        """Appelable depuis n'importe quel fil : file d'attente + fichier journal, jamais Tkinter."""
         try: self._logq.append((msg, color))
         except: pass
+        f = getattr(self, "_journal", None)
+        if f is not None:
+            try:
+                with self._journal_verrou:
+                    f.write(msg + "\n")
+            except Exception:
+                pass
+    def _log_lot(self, lot):
+        """Insère un lot de lignes en une fois et garde au plus LIGNES_MAX_JOURNAL lignes affichées."""
+        self.txt_log.config(state="normal")
+        for msg, color in lot:
+            tag = f"c{color.replace('#','')}"
+            if tag not in self._tags_log:
+                self.txt_log.tag_config(tag, foreground=color); self._tags_log.add(tag)
+            self.txt_log.insert(tk.END, msg + "\n", tag)
+        lignes = int(self.txt_log.index("end-1c").split(".")[0])
+        if lignes > LIGNES_MAX_JOURNAL:
+            self.txt_log.delete("1.0", f"{lignes - LIGNES_MAX_JOURNAL + 1}.0")
+            self.txt_log.insert("1.0", "… début du journal retiré de l'affichage (complet dans le fichier "
+                                       "journal, chemin en fin de traitement)\n", "c" + C_MUTED.replace("#", ""))
+        self.txt_log.see(tk.END)
+        self.txt_log.config(state="disabled")
     def _log_ui(self, msg, color=C_GREEN):
         self.txt_log.config(state="normal")
         tag=f"c{color.replace('#','')}"; self.txt_log.tag_config(tag, foreground=color)
@@ -480,6 +640,10 @@ class App(tk.Tk):
         save_config(self.cfg)
     def _open_prod(self):
         d=self.ent_prod_ia.get().strip()
+        if sp_cx.est_lien(d):
+            import webbrowser
+            try: return webbrowser.open(sp_cx.analyser_lien(d).url)
+            except sp_cx.LienInvalide as e: return messagebox.showinfo("Dossier", f"Lien invalide : {e}")
         if d and os.path.isdir(d):
             try: os.startfile(d)
             except: messagebox.showinfo("Dossier", d)
@@ -520,10 +684,13 @@ class App(tk.Tk):
 
     # ── Poller (main thread) ──
     def _poll(self):
+        # Au plus LIGNES_PAR_TOUR lignes par rafraîchissement : vider des milliers de lignes d'un
+        # coup figeait l'interface. Le reste passe aux tours suivants (tout est dans le fichier).
         try:
-            while self._logq:
-                msg, color = self._logq.pop(0)
-                self._log_ui(msg, color)
+            lot = self._logq[:LIGNES_PAR_TOUR]
+            del self._logq[:len(lot)]
+            if lot:
+                self._log_lot(lot)
         except: pass
         st = self._state
         if "prog" in st: self.lbl_prog.config(text=st["prog"])
@@ -552,61 +719,69 @@ class App(tk.Tk):
         if "stats" in st:
             for k,v in st["stats"].items():
                 if k in self._stat_vars: self._stat_vars[k].set(str(v))
-        if st.get("done"):
+        if st.get("done") and not self._logq:          # bilan affiché seulement une fois le journal à jour
             self._finish(st.pop("done")); self._running=False; return
         if self._running:
             self.after(250, self._poll)
 
     # ── Aperçu ──
-    def _scan(self):
-        """Liste les dossiers commune dans Prod IA."""
-        return lister_communes_prod(self.ent_prod_ia.get().strip())
-
     def _preview(self):
+        """Aperçu calculé EN ARRIÈRE-PLAN : lister Prod IA et vérifier le dossier SharePoint de
+        centaines de communes interroge OneDrive ; fait dans le fil de l'interface, cela la figeait
+        (« Ne répond pas ») à chaque collage. Comme dans audit_validation_finale."""
         if self._running: return
         self._save_cfg()
-        dispo = self._scan()
-        root_sp = self.ent_root_sp.get().strip()
+        demande = dict(par_ids=self._by_ids(), texte=self.txt_ids.get("1.0", "end") if self._by_ids() else "",
+                       prod=self.ent_prod_ia.get().strip(), root=self.ent_root_sp.get().strip())
+        self._apercu_gen = gen = getattr(self, "_apercu_gen", 0) + 1
+        boite = {}
+
+        def calcul():
+            try:
+                if sp_cx.est_lien(demande["prod"]) or sp_cx.est_lien(demande["root"]):
+                    with Sources(demande["prod"], demande["root"]) as src:      # inventaire par l'API
+                        boite["r"] = calculer_apercu(**demande, dispo=src.communes_prod(), existe=src.dest_existe)
+                else:
+                    boite["r"] = calculer_apercu(**demande)
+            except Exception as e: boite["r"] = {"erreur": str(e)}
+        threading.Thread(target=calcul, daemon=True).start()
+
+        def attendre():
+            if gen != getattr(self, "_apercu_gen", 0) or self._running:
+                return                          # périmé : une saisie plus récente a relancé l'aperçu
+            if "r" not in boite:
+                self.after(100, attendre); return
+            self._afficher_apercu(boite["r"])
+        self.after(50, attendre)
+
+    def _afficher_apercu(self, a):
         for r in self.tree.get_children(): self.tree.delete(r)
         self.tree.tag_configure("todo", foreground=C_AMBER)
         self.tree.tag_configure("no", foreground=C_RED)
-        if self._by_ids():
-            return self._preview_ids(dispo, root_sp)
-        n_ok=0; n_no=0
-        for com in sorted(dispo.keys()):
-            dep = get_dep(com)
-            dest_ok = os.path.isdir(os.path.join(root_sp, dep, com))
-            if dest_ok:
-                self.tree.insert("","end", values=(com,dep,"—","","—","","","⏳ À ranger"), tags=("todo",)); n_ok+=1
-            else:
-                self.tree.insert("","end", values=(com,dep,"—","","—","","","❌ Dest. absente"), tags=("no",)); n_no+=1
-        self._stat_vars["communes"].set(str(len(dispo)))
-        if len(dispo)==0:
-            self._set_status("📭 Prod IA est vide — rien à ranger", C_MUTED)
+        if a.get("erreur"):
+            return self._set_status(f"⚠️ Aperçu impossible : {a['erreur']}", C_AMBER)
+        for com, dep, n, statut, ok in a["lignes"]:
+            self.tree.insert("","end", values=(com,dep,n,"","—" if n == "—" else "","","",statut),
+                             tags=("todo" if ok else "no",))
+        self._stat_vars["communes"].set(str(len(a["lignes"])))
+        if not a["par_ids"]:
+            if not a["lignes"]:
+                return self._set_status("📭 Prod IA est vide — rien à ranger", C_MUTED)
+            return self._set_status(f"📁 {a['n_ok']} commune(s) à ranger"
+                                    + (f" · {a['n_no']} sans destination" if a["n_no"] else ""),
+                                    C_ACCENT if a["n_ok"] else C_AMBER)
+        if a["nb"]:
+            self.lbl_ids.config(text=f"  {a['nb']} ID imm détecté(s) sur {len(a['lignes'])} commune(s)", fg=C_ACCENT)
+        elif a["anciens"]:
+            self.lbl_ids.config(fg=C_AMBER, text=f"  ⚠️ {a['anciens']} ID erreur reconnu(s), mais la mise à jour se "
+                                "fait désormais par ID imm (ex : ID-3806800000IW) : collez la colonne « ID imm »")
         else:
-            self._set_status(f"📁 {n_ok} commune(s) à ranger" + (f" · {n_no} sans destination" if n_no else ""),
-                             C_ACCENT if n_ok else C_AMBER)
-
-    def _preview_ids(self, dispo, root_sp):
-        groupes = self._ids()
-        nb = sum(len(v) for v in groupes.values())
-        self.lbl_ids.config(text=f"  {nb} ID erreur détecté(s) sur {len(groupes)} commune(s)" if nb
-                            else "  Aucun ID erreur détecté (format attendu : 74143_1)",
-                            fg=C_ACCENT if nb else C_MUTED)
-        n_ok=0; n_no=0
-        for com, ids in groupes.items():
-            dep = get_dep(com)
-            if com not in dispo: statut = "❌ Absent de Prod IA"
-            elif not os.path.isdir(os.path.join(root_sp, dep, com)): statut = "❌ Dest. absente"
-            else: statut = "⏳ À mettre à jour"
-            ok = statut.startswith("⏳"); n_ok += ok; n_no += not ok
-            self.tree.insert("","end", values=(com,dep,len(ids),"","","","",statut), tags=("todo" if ok else "no",))
-        self._stat_vars["communes"].set(str(len(groupes)))
-        if not groupes:
-            self._set_status("✍️ Collez des ID erreur pour préparer la mise à jour", C_MUTED)
-        else:
-            self._set_status(f"🎯 {nb} ID sur {n_ok} commune(s) prête(s)" + (f" · {n_no} non traitable(s)" if n_no else ""),
-                             C_ACCENT if n_ok else C_AMBER)
+            self.lbl_ids.config(text="  Aucun ID imm détecté (format attendu : ID-3806800000IW)", fg=C_MUTED)
+        if not a["lignes"]:
+            return self._set_status("✍️ Collez des ID imm pour préparer la mise à jour", C_MUTED)
+        self._set_status(f"🎯 {a['nb']} ID imm sur {a['n_ok']} commune(s) prête(s)"
+                         + (f" · {a['n_no']} non traitable(s)" if a["n_no"] else ""),
+                         C_ACCENT if a["n_ok"] else C_AMBER)
 
     # ── Lancer le rangement ──
     def _run(self):
@@ -614,57 +789,122 @@ class App(tk.Tk):
         root_sp = self.ent_root_sp.get().strip()
         prod_ia = self.ent_prod_ia.get().strip()
         supprimer = bool(self.var_supp.get())
-        if not os.path.isdir(root_sp):
-            messagebox.showwarning("Erreur","Racine SharePoint introuvable."); return
-        if not os.path.isdir(prod_ia):
-            messagebox.showwarning("Erreur","Dossier Prod IA introuvable."); return
+        for texte, nom in ((root_sp, "Racine SharePoint"), (prod_ia, "Dossier À déposer")):
+            if sp_cx.est_lien(texte):
+                try:
+                    sp_cx.analyser_lien(texte)
+                except sp_cx.LienInvalide as e:
+                    messagebox.showwarning("Erreur", f"{nom} : lien SharePoint invalide ({e})."); return
+                if not sp_cx.est_connecte(texte):
+                    messagebox.showwarning("Connexion SharePoint requise",
+                        f"{nom} est un lien SharePoint : cliquez d'abord sur « 🔗 Se connecter à SharePoint » "
+                        "et identifiez-vous dans la fenêtre du navigateur."); return
+            elif not os.path.isdir(texte):
+                messagebox.showwarning("Erreur", f"{nom} introuvable."); return
         if self._by_ids():
             return self._run_ids(root_sp, prod_ia, supprimer)
 
-        dispo = self._scan()
+        def inventaire():
+            src = Sources(prod_ia, root_sp)
+            return src, src.communes_prod()
+        self._en_fond("🔄 Inventaire du dossier À déposer…", inventaire,
+                      lambda r: self._run_commune_confirmer(root_sp, prod_ia, supprimer, *r))
+
+    def _en_fond(self, statut, travail, suite):
+        """Exécute `travail` dans un fil (OneDrive / API SharePoint), puis `suite(résultat)` dans l'interface."""
+        self.btn_run.config(state="disabled")
+        self._set_status(statut, C_ACCENT)
+        boite = {}
+
+        def fil():
+            try: boite["r"] = travail()
+            except Exception as e: boite["e"] = e
+        threading.Thread(target=fil, daemon=True).start()
+
+        def attendre():
+            if not boite:
+                self.after(100, attendre); return
+            self.btn_run.config(state="normal")
+            if "e" in boite:
+                self._set_status(f"⚠️ {boite['e']}", C_AMBER)
+                return messagebox.showwarning("Erreur", f"Vérification des dossiers impossible : {boite['e']}")
+            suite(boite["r"])
+        self.after(100, attendre)
+
+    def _run_commune_confirmer(self, root_sp, prod_ia, supprimer, src, dispo):
         if not dispo:
+            src.__exit__(None, None, None)
             messagebox.showinfo("Rien à faire","Prod IA est vide — aucun dossier commune à ranger."); return
 
         codes = sorted(dispo.keys())
-        supp_txt = "supprimés de Prod IA" if supprimer else "conservés dans Prod IA"
+        supp_txt = ("mis à la corbeille SharePoint" if src.prod_lien else "supprimés de Prod IA") if supprimer \
+            else "conservés dans Prod IA"
         if not messagebox.askyesno("Rangement",
-                f"Ranger {len(codes)} commune(s) : {', '.join(codes)} ?\n\n"
+                f"Ranger {len(codes)} commune(s) : {_apercu(codes, 30)} ?\n\n"
                 "• Excel → Dep/commune/ (remplace le vierge)\n"
                 "• PPT → Dep/commune/analyse/\n"
                 f"• Dossiers {supp_txt} après rangement\n\n"
-                "⚠️ Cette action écrase les fichiers SharePoint."): return
+                "⚠️ Cette action écrase les fichiers SharePoint."):
+            src.__exit__(None, None, None); return
 
         self._start_ui(len(codes), "Rangement", "📦 RANGEMENT EN COURS")
 
         def do():
             tot={"mode":"commune","communes":0,"lignes":"—","excel":0,"ppt":0,"err":0}
             self._log(f"\n📦 RANGEMENT de {len(codes)} commune(s)", C_ACCENT)
-            self._log(f"📂 Source : {prod_ia}", C_MUTED)
-            self._log(f"📂 Cible  : {root_sp}\\DepXX\\commune", C_MUTED)
+            self._log(f"📂 Source : {src.libelle('prod')}", C_MUTED)
+            self._log(f"📂 Cible  : {src.libelle('root')} → DepXX/commune", C_MUTED)
             self._log("─"*50, C_MUTED)
-            for i,commune in enumerate(codes,1):
-                self._state["gpos"]=i-1
-                self._state["prog"]=f"Commune {i}/{len(codes)} — {commune}"
-                self._state["row_insert"]=commune
-                self._log(f"\n📍 Commune {commune}  ({i}/{len(codes)})", C_AMBER)
-                stats = ranger_commune(prod_ia, root_sp, commune, dispo[commune],
-                                       supprimer, self._log, phase_fn=self._cb_phase)
-                self._state["gpos"]=i
-                if stats is not None:
-                    tot["communes"]+=1; tot["excel"]+=stats["excel"]
-                    tot["ppt"]+=stats["ppt"]; tot["err"]+=stats["err"]
-                    ok = stats["err"]==0
-                    statut = "✅ Rangé" if ok else f"⚠️ {stats['err']} erreur(s)"
-                    self._state["row_update"] = ((commune,get_dep(commune),"—",stats["excel"],"—",
-                                                  stats["ppt"],stats["err"],statut), ok)
-                else:
-                    tot["err"]+=1
-                    self._state["row_update"] = ((commune,get_dep(commune),"—","","—","","","❌ Dest. absente"), False)
-                self._state["stats"]=dict(tot)
+            interrompu = ""
+            try:
+                with src, PowerPointALaDemande() as pp:
+                    for i,commune in enumerate(codes,1):
+                        self._state["gpos"]=i-1
+                        self._state["prog"]=f"Commune {i}/{len(codes)} — {commune}"
+                        self._state["row_insert"]=commune
+                        if interrompu:
+                            tot["err"]+=1
+                            self._state["row_update"] = ((commune,get_dep(commune),"—","","—","","","⏸️ Reporté"), False)
+                            self._state["gpos"]=i; self._state["stats"]=dict(tot)
+                            continue
+                        self._log(f"\n📍 Commune {commune}  ({i}/{len(codes)})", C_AMBER)
+                        libelle = "❌ Dest. absente"
+                        try:
+                            ch = src.preparer(commune, ppt=pp)
+                            stats = ranger_commune(ch.prod_ia, ch.root_sp, commune, ch.dossier_src, supprimer,
+                                                   self._log, phase_fn=self._cb_phase, publier=ch.publier,
+                                                   ppt_coedition=pp)
+                            ch.finaliser(self._log)
+                        except Exception as e:
+                            stats, libelle = None, "❌ SharePoint" if src.distant else "❌ Erreur"
+                            raison = self._raison_sharepoint(e)
+                            self._log(f"  ❌ {raison}", C_RED)
+                            if isinstance(e, (sp_rest.AuthentificationRequise, sp_rest.TelechargementInterdit)):
+                                interrompu = raison
+                        if src.session_expiree and not interrompu:
+                            interrompu = sp_cx_message_session(src.session_expiree)
+                        if interrompu:
+                            self._log(f"\n⛔ Lot interrompu : {interrompu}", C_RED)
+                        self._state["gpos"]=i
+                        if stats is not None:
+                            tot["communes"]+=1; tot["excel"]+=stats["excel"]
+                            tot["ppt"]+=stats["ppt"]; tot["err"]+=stats["err"]
+                            ok = stats["err"]==0
+                            statut = "✅ Rangé" if ok else f"⚠️ {stats['err']} erreur(s)"
+                            self._state["row_update"] = ((commune,get_dep(commune),"—",stats["excel"],"—",
+                                                          stats["ppt"],stats["err"],statut), ok)
+                        else:
+                            tot["err"]+=1
+                            self._state["row_update"] = ((commune,get_dep(commune),"—","","—","","",libelle), False)
+                        self._state["stats"]=dict(tot)
+                    if not interrompu:
+                        self._supprimer_adeposer(src, supprimer)
+            except Exception as e:
+                tot["err"]+=1
+                self._log(f"\n❌ Traitement interrompu : {e}", C_RED)
             el=_time.time()-self._t_start
             self._log(f"\n🎉 TERMINÉ — {tot['communes']} commune(s) en {self._fmt(el)}", C_GREEN)
             self._log(f"  Excel:{tot['excel']} · PPT:{tot['ppt']} · Erreurs:{tot['err']}", C_MUTED)
-            self._supprimer_adeposer(prod_ia)
             tot["_el"]=el; self._state["done"]=tot
 
         threading.Thread(target=do, daemon=True).start()
@@ -672,14 +912,21 @@ class App(tk.Tk):
     def _run_ids(self, root_sp, prod_ia, supprimer):
         groupes = self._ids()
         if not groupes:
-            messagebox.showinfo("Rien à faire","Aucun ID erreur valide détecté (format attendu : 74143_1)."); return
+            anciens = sum(len(v) for v in extraire_ids(self.txt_ids.get("1.0", "end")).values())
+            messagebox.showinfo("Rien à faire", "Aucun ID imm valide détecté (format attendu : ID-3806800000IW)."
+                                + (f"\n\n{anciens} ID erreur reconnu(s) : la mise à jour se fait désormais par "
+                                   "ID imm, qui désigne une ligne précise. Collez la colonne « ID imm »." if anciens else ""))
+            return
         ppt_mode = self._ppt_mode()
-        dispo = self._scan()
         codes = list(groupes)
         nb = sum(len(v) for v in groupes.values())
         ppt_txt = {"remplacer": "PPT → remplacés par ceux de Prod IA",
                    "modifier":  "PPT → Analyse et Lien Street View modifiés (colonnes Remarque / Lien Street View)",
                    None:        "PPT → non traités"}[ppt_mode]
+        if ppt_mode:
+            from ..services.ppt_com import powerpoint_disponible
+            ppt_txt += (" ; PPT ouvert par quelqu'un → co-édition PowerPoint (zones seules, ou diapositives)"
+                        if powerpoint_disponible() else " ; PPT ouvert par quelqu'un → en attente (PowerPoint absent)")
         colonnes = self._colonnes_maj()
         if colonnes is None and ppt_mode is not None:
             # Les PPT n'ont pas besoin des colonnes : on peut les traiter sans toucher à l'Excel
@@ -709,11 +956,34 @@ class App(tk.Tk):
         supp_txt = ("supprimés de Prod IA (s'ils ne contiennent pas d'autres ID)" if supprimer
                     else "conservés dans Prod IA")
         excel_com = bool(self.var_excel_com.get()) and self._excel_ok
-        ecriture_txt = ("Écriture → via Excel, en co-édition SharePoint (valeurs vérifiées)" if excel_com
-                        else "Écriture → réécriture du fichier (⚠️ perdue si le fichier est ouvert ailleurs)")
-        # Bilan préalable : ce qui ne pourra pas être traité, dit AVANT de lancer
-        sans_prod = [c for c in codes if c not in dispo]
-        sans_sp = [c for c in codes if c in dispo and not os.path.isdir(os.path.join(root_sp, get_dep(c), c))]
+        if sp_cx.est_lien(root_sp):
+            ecriture_txt = ("Écriture → API SharePoint avec votre session : remplacement seulement si le fichier "
+                            "n'a pas changé depuis sa lecture (sinon relu et refait) ; fichier ouvert par "
+                            "quelqu'un → co-édition Excel" + (" (Excel pour chaque fichier : case cochée)" if excel_com
+                                                               else "" if self._excel_ok else " indisponible : ID en attente"))
+        elif excel_com:
+            ecriture_txt = "Écriture → via Excel, en co-édition SharePoint (valeurs vérifiées)"
+        elif self._excel_ok:
+            ecriture_txt = ("Écriture → via Excel (co-édition) pour les fichiers synchronisés SharePoint ou "
+                            "ouverts ; réécriture directe des autres")
+        else:
+            ecriture_txt = ("Écriture → réécriture du fichier ; un fichier ouvert n'est PAS modifié "
+                            "(Excel indisponible pour la co-édition)")
+        if supprimer and sp_cx.est_lien(prod_ia):
+            supp_txt = "mis à la corbeille SharePoint (s'ils ne contiennent pas d'autres ID)"
+        # Bilan préalable EN ARRIÈRE-PLAN (OneDrive ou API SharePoint pour chaque commune), puis confirmation
+        def verifier():
+            src = Sources(prod_ia, root_sp)
+            dispo = src.communes_prod()
+            return (src, dispo, [c for c in codes if c not in dispo],
+                    [c for c in codes if c in dispo and not src.dest_existe(c)])
+        self._en_fond(f"🔄 Vérification des dossiers de {len(codes)} commune(s)…", verifier,
+                      lambda r: self._run_ids_confirmer(root_sp, prod_ia, supprimer, groupes, codes, nb, ppt_mode,
+                                                        ppt_txt, colonnes, excel_txt, supp_txt, excel_com,
+                                                        ecriture_txt, *r))
+
+    def _run_ids_confirmer(self, root_sp, prod_ia, supprimer, groupes, codes, nb, ppt_mode, ppt_txt,
+                           colonnes, excel_txt, supp_txt, excel_com, ecriture_txt, src, dispo, sans_prod, sans_sp):
         prealable = ""
         if sans_prod:
             prealable += (f"⚠️ {len(sans_prod)} commune(s) sur {len(codes)} n'ont PAS de dossier dans Prod IA "
@@ -721,24 +991,25 @@ class App(tk.Tk):
                           "après succès) ou pas encore déposées. Elles seront signalées sans être traitées.\n")
         if sans_sp:
             prealable += f"⚠️ {len(sans_sp)} commune(s) sans dossier SharePoint ({_apercu(sans_sp)}).\n"
-        if not messagebox.askyesno("Mise à jour par ID erreur",
-                f"Mettre à jour {nb} ID erreur sur {len(codes)} commune(s) : {_apercu(codes, 12)} ?\n\n"
+        if not messagebox.askyesno("Mise à jour par ID imm",
+                f"Mettre à jour {nb} ID imm sur {len(codes)} commune(s) : {_apercu(codes, 12)} ?\n\n"
                 + (prealable + "\n" if prealable else "") +
                 f"• {excel_txt}\n"
                 f"• {ecriture_txt}\n"
                 f"• {ppt_txt}\n"
                 "• Onglet Audit → filtres retirés, lignes et colonnes masquées réaffichées\n"
                 f"• Dossiers {supp_txt}\n\n"
-                "Les ID non appliqués seront ajoutés à la liste « ID en attente »."): return
+                "Les ID non appliqués seront ajoutés à la liste « ID en attente »."):
+            src.__exit__(None, None, None); return
 
         self._start_ui(len(codes), "Mise à jour ID", "🎯 MISE À JOUR PAR ID EN COURS")
 
         def do():
             tot={"mode":"ids","communes":0,"lignes":0,"excel":0,"ppt":0,"err":0}
             echecs, reussis = {}, []
-            self._log(f"\n🎯 MISE À JOUR de {nb} ID erreur sur {len(codes)} commune(s)", C_ACCENT)
-            self._log(f"📂 Source : {prod_ia}", C_MUTED)
-            self._log(f"📂 Cible  : {root_sp}\\DepXX\\commune", C_MUTED)
+            self._log(f"\n🎯 MISE À JOUR de {nb} ID imm sur {len(codes)} commune(s)", C_ACCENT)
+            self._log(f"📂 Source : {src.libelle('prod')}", C_MUTED)
+            self._log(f"📂 Cible  : {src.libelle('root')} → DepXX/commune", C_MUTED)
             self._log(f"📊 {excel_txt}", C_MUTED)
             self._log(f"🔐 {ecriture_txt}", C_MUTED)
             self._log(f"🖼️  {ppt_txt}", C_MUTED)
@@ -747,31 +1018,59 @@ class App(tk.Tk):
             self._log("─"*50, C_MUTED)
             # Session surveillée : fil COM dédié + relance d'Excel s'il ne répond plus.
             # PPT seuls (aucune colonne cochée) : Excel n'est pas lancé du tout.
-            session = (SessionExcelSurveillee(visible=self.cfg.get("excel_visible", False),
-                                              delai_occupe_s=self.cfg.get("excel_delai_occupe_s", 120),
-                                              delai_blocage_s=self.cfg.get("excel_delai_blocage_s", 120))
-                       if excel_com and colonnes else nullcontext())
+            # Voie d'écriture choisie fichier par fichier (services/ecriture.py) : co-édition Excel
+            # si la case est cochée, si le fichier est synchronisé avec SharePoint ou s'il est
+            # ouvert ; réécriture directe seulement d'un fichier local libre.
+            fabrique = ((lambda: SessionExcelSurveillee(visible=self.cfg.get("excel_visible", False),
+                                                        delai_occupe_s=self.cfg.get("excel_delai_occupe_s", 120),
+                                                        delai_blocage_s=self.cfg.get("excel_delai_blocage_s", 120)))
+                        if self._excel_ok else None)
+            session = SessionEcriture(fabrique, toujours_excel=excel_com) if colonnes else nullcontext()
+            # PPT ouvert par quelqu'un (verrou local ~$ ou SharePoint) : PowerPoint, démarré à la
+            # demande, l'écrit en co-édition au lieu de le laisser de côté.
+            pp = PowerPointALaDemande() if ppt_mode else nullcontext()
+            reprises = int(self.cfg.get("reprises_verrou", 1)); delai_reprise = float(self.cfg.get("delai_reprise_s", 60))
             try:
                 # Disjoncteur du lot : si OneDrive bloque plusieurs communes d'affilée, une pause,
                 # puis arrêt du lot (les communes restantes passent en attente) plutôt que
                 # d'enchaîner des centaines d'échecs.
-                ko_suite, pause_faite, interrompu = 0, False, False
-                with session as xl:
+                ko_suite, pause_faite, interrompu = 0, False, ""
+                err_commune = {}            # erreurs du 1er passage, remplacées par celles d'un nouvel essai
+                ppt_commune = {}            # PPT déjà comptés (un nouvel essai les refait : pas de double compte)
+                with src, session as xl, pp as ppt:
                     for i,commune in enumerate(codes,1):
                         ids = groupes[commune]; dep = get_dep(commune)
                         self._state["gpos"]=i-1
                         self._state["prog"]=f"Commune {i}/{len(codes)} — {commune} ({len(ids)} ID)"
                         self._state["row_insert"]=commune
                         if interrompu:
-                            echecs.update({x: "lot interrompu : OneDrive refusait les opérations, rejouez plus tard"
-                                           for x in ids})
+                            echecs.update({x: f"lot interrompu : {interrompu}" for x in ids})
                             self._state["row_update"] = ((commune,dep,len(ids),"","","","","⏸️ Reporté"), False)
                             self._state["gpos"]=i; self._state["stats"]=dict(tot)
                             continue
                         self._log(f"\n📍 Commune {commune}  ({i}/{len(codes)}) — {', '.join(ids)}", C_AMBER)
-                        stats = ranger_ids(root_sp, commune, dispo.get(commune), ids, ppt_mode,
-                                           supprimer, self._log, phase_fn=self._cb_phase, colonnes=colonnes,
-                                           maj_excel=xl.maj_lignes if xl else None)
+                        try:
+                            if commune in dispo:
+                                ch = src.preparer(commune, ids, ppt_mode, excel=bool(colonnes), ppt=ppt)
+                                stats = ranger_ids(ch.root_sp, commune, ch.dossier_src, ids, ppt_mode,
+                                                   supprimer, self._log, phase_fn=self._cb_phase, colonnes=colonnes,
+                                                   maj_excel=ch.maj_excel(xl), publier=ch.publier,
+                                                   ppt_coedition=ppt)
+                                ch.finaliser(self._log)
+                            else:       # signalée sans rien télécharger
+                                stats = ranger_ids(src.root_local, commune, None, ids, ppt_mode, supprimer,
+                                                   self._log, phase_fn=self._cb_phase, colonnes=colonnes)
+                        except Exception as e:
+                            raison = self._raison_sharepoint(e)
+                            self._log(f"  ❌ {raison}", C_RED)
+                            stats = {"bloquant": raison, "echecs": {x: raison for x in ids}}
+                            if isinstance(e, (sp_rest.AuthentificationRequise, sp_rest.TelechargementInterdit)):
+                                interrompu = raison
+                        if src.session_expiree and not interrompu:
+                            interrompu = sp_cx_message_session(src.session_expiree)
+                        if interrompu:
+                            self._log(f"\n⛔ Lot interrompu : {interrompu}. Les {len(codes) - i} commune(s) "
+                                      "restantes passent en attente.", C_RED)
                         self._state["gpos"]=i
                         if stats is not None and stats.get("bloquant"):
                             tot["err"]+=1
@@ -781,10 +1080,11 @@ class App(tk.Tk):
                         elif stats is not None:
                             tot["communes"]+=1
                             for k in ("lignes","excel","ppt","err"): tot[k]+=stats[k]
+                            err_commune[commune] = stats["err"]; ppt_commune[commune] = stats["ppt"]
                             echecs.update(stats["echecs"])
                             reussis += [x for x in ids if x not in stats["echecs"]]
                             ok = stats["err"]==0
-                            if any("mode exclusif" in r for r in stats["echecs"].values()):
+                            if any("verrouillé par" in r for r in stats["echecs"].values()):
                                 statut = "🔒 Verrouillé"
                             elif stats.get("onedrive_ko"):
                                 statut = "☁️ Refus OneDrive"
@@ -809,11 +1109,53 @@ class App(tk.Tk):
                                           f"de suite : pause de {PAUSE_ONEDRIVE_S} s pour le laisser se rétablir…", C_AMBER)
                                 _time.sleep(PAUSE_ONEDRIVE_S)
                             else:
-                                interrompu = True
+                                interrompu = "OneDrive refusait les opérations, rejouez plus tard"
                                 self._log(f"\n⛔ OneDrive refuse toujours les opérations : lot interrompu. Les "
                                           f"{len(codes) - i} commune(s) restantes passent en attente. Vérifiez OneDrive "
                                           "(lancé, connecté, non suspendu, espace disque) puis « Charger les ID en "
                                           "attente ».", C_RED)
+                    # Fichiers ouverts par quelqu'un (hors extraits) : nouveaux essais après un délai,
+                    # le temps qu'il soit fermé ou passe en co-édition — comme audit_validation_finale.
+                    for tour in range(1, reprises + 1):
+                        if interrompu:
+                            break
+                        a_rejouer = {c: [x for x in groupes[c] if x in echecs and _ouvert_ailleurs(echecs[x])]
+                                     for c in codes}
+                        a_rejouer = {c: v for c, v in a_rejouer.items() if v}
+                        if not a_rejouer:
+                            break
+                        self._log(f"\n⏳ {sum(map(len, a_rejouer.values()))} ID refusé(s) car leur fichier est ouvert "
+                                  f"({_apercu(a_rejouer, 6)}) : nouvel essai {tour}/{reprises} dans "
+                                  f"{delai_reprise:.0f} s", C_AMBER)
+                        self._state["prog"] = f"⏳ Fichiers ouverts : nouvel essai dans {delai_reprise:.0f} s"
+                        _time.sleep(delai_reprise)
+                        for commune, ids in a_rejouer.items():
+                            dep = get_dep(commune)
+                            self._log(f"\n🔁 Commune {commune} — nouvel essai : {', '.join(ids)}", C_AMBER)
+                            self._state["prog"] = f"Nouvel essai {tour}/{reprises} — {commune}"
+                            try:
+                                ch = src.preparer(commune, ids, ppt_mode, excel=bool(colonnes), ppt=ppt)
+                                st = ranger_ids(ch.root_sp, commune, ch.dossier_src, ids, ppt_mode, supprimer,
+                                                self._log, phase_fn=self._cb_phase, colonnes=colonnes,
+                                                maj_excel=ch.maj_excel(xl), publier=ch.publier, ppt_coedition=ppt)
+                                ch.finaliser(self._log)
+                            except Exception as e:
+                                self._log(f"  ❌ {self._raison_sharepoint(e)}", C_RED)
+                                continue
+                            if st.get("bloquant"):
+                                continue
+                            tot["lignes"] += st["lignes"]; tot["ppt"] += max(0, st["ppt"] - ppt_commune.get(commune, 0))
+                            tot["err"] += st["err"] - err_commune.get(commune, 0); err_commune[commune] = st["err"]
+                            for x in ids:
+                                if x in st["echecs"]:
+                                    echecs[x] = st["echecs"][x]
+                                else:
+                                    echecs.pop(x, None); reussis.append(x)
+                            restant = [x for x in groupes[commune] if x in echecs]
+                            statut = "✅ Mis à jour (nouvel essai)" if not restant else f"⚠️ {len(restant)} ID en attente"
+                            self._state["row_update"] = ((commune,dep,len(groupes[commune]),st["excel"],st["lignes"],
+                                                          st["ppt"],len(restant),statut), not restant)
+                            self._state["stats"]=dict(tot)
             except ExcelIndisponible as e:
                 tot["err"]+=1
                 echecs.update({x: f"Excel indisponible : {e}" for c in codes for x in groupes[c] if x not in reussis})
@@ -835,7 +1177,8 @@ class App(tk.Tk):
             else:
                 self._log(f"\n✅ Tous les ID ont été appliqués" +
                           (f" · {len(liste)} ID restent en attente d'un précédent dispatch" if liste else ""), C_GREEN)
-            self._supprimer_adeposer(prod_ia)
+            if not interrompu:
+                self._supprimer_adeposer(src, supprimer)
             tot["echecs"]=len(echecs); tot["attente"]=len(liste)
             tot["_el"]=el; self._state["done"]=tot
 
@@ -869,15 +1212,47 @@ class App(tk.Tk):
         self.progress["value"]=0; self.progress["maximum"]=n
         self._t_start=_time.time(); self._tick()
         self._logq=[]; self._state=_EtatPartage(gmax=n, gpos=0); self._running=True
+        self._ouvrir_journal(hdr)
         self.after(250, self._poll)
 
-    def _supprimer_adeposer(self, prod_ia):
-        """Supprime le dossier "À déposer" entier s'il est vide (tout rangé)."""
-        if not (bool(self.var_supp.get()) and self.cfg.get("supp_adeposer", True)): return
-        supprimer_si_vide(prod_ia, self._log)
+    def _supprimer_adeposer(self, src, supprimer):
+        """Supprime le dossier "À déposer" entier s'il est vide (tout rangé) — jamais sur SharePoint.
+        Appelé depuis le fil de traitement : `supprimer` est lu AVANT le lancement. Lire une case
+        Tkinter (var_supp.get()) depuis un autre fil que celui de l'interface peut planter l'outil."""
+        if not (supprimer and self.cfg.get("supp_adeposer", True)): return
+        src.supprimer_si_vide(self._log)
+
+    @staticmethod
+    def _raison_sharepoint(e):
+        """Explication d'un échec de préparation d'une commune (API SharePoint, disque…)."""
+        if isinstance(e, sp_rest.TelechargementInterdit):
+            return "SharePoint : téléchargement interdit depuis cet appareil (accès conditionnel de l'organisation)"
+        if isinstance(e, sp_rest.AuthentificationRequise):
+            return sp_cx_message_session(e)
+        return f"SharePoint : {e}" if isinstance(e, (OSError, RuntimeError)) else f"erreur : {e}"
+
+    def _ouvrir_journal(self, titre):
+        """Journal complet du lot dans un fichier : l'affichage, lui, est limité."""
+        try:
+            os.makedirs(RAPPORTS_DIR, exist_ok=True)
+            self._journal_chemin = os.path.join(RAPPORTS_DIR, f"journal_{_time.strftime('%Y-%m-%d_%H%M%S')}.txt")
+            self._journal = open(self._journal_chemin, "w", encoding="utf-8")
+            self._journal.write(f"{titre} — {_time.strftime('%d/%m/%Y %H:%M:%S')}\n")
+        except OSError:
+            self._journal = self._journal_chemin = None
+
+    def _fermer_journal(self):
+        with self._journal_verrou:
+            f, self._journal = self._journal, None
+        if f is not None:
+            try: f.close()
+            except OSError: pass
 
     def _finish(self, tot):
         el=tot.get("_el",0); self._t_start=None
+        self._fermer_journal()
+        if self._journal_chemin:
+            self._log_lot([(f"📄 Journal complet : {self._journal_chemin}", C_ACCENT)])
         self.btn_run.config(state="normal"); self._set_hdr("Prêt", C_GREEN)
         par_ids = tot.get("mode") == "ids"
         detail = f"{tot['lignes']} ligne(s)" if par_ids else f"{tot['ppt']} PPT"
@@ -899,4 +1274,5 @@ class App(tk.Tk):
             corps = (f"✅ {tot['communes']} commune(s) rangée(s) en {self._fmt(el)}\n\n"
                      f"Excel remplacés : {tot['excel']}\nPPT déposés : {tot['ppt']}\n")
         messagebox.showinfo("Terminé", corps + f"Erreurs : {tot['err']}\n\n"
-                            "OneDrive synchronise vers SharePoint.")
+                            + ("Fichiers écrits directement sur SharePoint." if sp_cx.est_lien(self.ent_root_sp.get())
+                               else "OneDrive synchronise vers SharePoint."))

@@ -20,6 +20,8 @@ DEFAULT_CFG = {
     "excel_visible": False, # mode ids : afficher Excel pendant l'écriture (diagnostic)
     "excel_delai_occupe_s": 120,  # mode ids : attente max quand Excel répond « occupé » (par appel)
     "excel_delai_blocage_s": 120, # mode ids : sans signe de vie d'Excel pendant ce délai, il est tué et relancé
+    "reprises_verrou": 1,   # mode ids : nouveaux essais des ID refusés car leur fichier est ouvert par quelqu'un
+    "delai_reprise_s": 60,  # mode ids : attente avant chaque nouvel essai
 }
 
 

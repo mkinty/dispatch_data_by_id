@@ -51,5 +51,5 @@ def test_ranger_ids_excel_bloque_met_tout_en_attente(tmp_path):
 
     st = ranger_ids(str(root), "74143", str(src_dir), ["74143_1"], None, True, log, maj_excel=maj_bloquee)
     assert st["lignes"] == 0 and st["err"] == 1
-    assert st["echecs"] == {"74143_1": "Excel ouvert en mode exclusif par Jean Dupont"}
+    assert st["echecs"] == {"74143_1": "audit_74143.xlsx verrouillé par Jean Dupont"}
     assert src_dir.exists()

@@ -3,7 +3,7 @@ import os
 import re
 import shutil
 
-from .constantes import DEP_PREFIX, AUDIT_PREFIX, COL_ID_ERR, LOG_WARN, LOG_ERR
+from .constantes import DEP_PREFIX, AUDIT_PREFIX, COL_ID_ERR, COL_ID_IMM, LOG_WARN, LOG_ERR
 from .excel_rows import lire_entetes
 from .fichiers_cloud import copier
 
@@ -114,8 +114,8 @@ def detecter_colonnes(prod_ia, root_sp, essais=12, delai_s=45):
                 cols = lire_entetes(f)
             except Exception as e:
                 rapport.append(f"  ✗ {os.path.basename(f)} : {_raison(e)}"); continue
-            if COL_ID_ERR not in cols:
-                rapport.append(f"  ✗ {os.path.basename(f)} : pas de colonne « {COL_ID_ERR} » en ligne 1 de l'onglet Audit")
+            if COL_ID_IMM not in cols and COL_ID_ERR not in cols:
+                rapport.append(f"  ✗ {os.path.basename(f)} : pas de colonne « {COL_ID_IMM} » ni « {COL_ID_ERR} » en ligne 1 de l'onglet Audit")
                 continue
             return cols, f, rapport
     return [], None, rapport
@@ -165,3 +165,34 @@ def supprimer_si_vide(prod_ia, log_fn):
             log_fn(f"\n⚠️ '{os.path.basename(prod_ia)}' conservé ({len(restant)} commune(s) non rangée(s) : {', '.join(restant)})", LOG_WARN)
     except Exception as e:
         log_fn(f"\n⚠️ Impossible de supprimer le dossier : {e}", LOG_WARN)
+
+
+def calculer_apercu(par_ids, texte, prod, root, dispo=None, existe=None):
+    """Données de l'aperçu (tableau, compteurs), sans aucune interface : peut tourner dans un fil.
+
+    Mode ID imm : une ligne par commune des ID collés ; mode commune : une par dossier de Prod IA.
+    lignes = [(commune, Dep, nb ID ou « — », statut, ok)].
+    dispo / existe : inventaire déjà fait (sources SharePoint par lien) ; sinon dossiers locaux."""
+    from .error_ids import extraire_ids, extraire_ids_imm
+    dispo = lister_communes_prod(prod) if dispo is None else dispo
+    existe = existe or (lambda com: os.path.isdir(os.path.join(root, get_dep(com), com)))
+    res = {"par_ids": par_ids, "lignes": [], "nb": 0, "n_ok": 0, "n_no": 0, "anciens": 0}
+    if par_ids:
+        groupes = extraire_ids_imm(texte)
+        res["nb"] = sum(len(v) for v in groupes.values())
+        if not groupes:
+            res["anciens"] = sum(len(v) for v in extraire_ids(texte).values())
+        for com, ids in groupes.items():
+            dep = get_dep(com)
+            if com not in dispo: statut = "❌ Absent de Prod IA"
+            elif not existe(com): statut = "❌ Dest. absente"
+            else: statut = "⏳ À mettre à jour"
+            res["lignes"].append((com, dep, len(ids), statut, statut.startswith("⏳")))
+    else:
+        for com in sorted(dispo):
+            dep = get_dep(com)
+            ok = existe(com)
+            res["lignes"].append((com, dep, "—", "⏳ À ranger" if ok else "❌ Dest. absente", ok))
+    res["n_ok"] = sum(1 for l in res["lignes"] if l[4])
+    res["n_no"] = len(res["lignes"]) - res["n_ok"]
+    return res

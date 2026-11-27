@@ -42,7 +42,10 @@ def montages_onedrive() -> list[tuple[str, str]]:
 
 
 def url_sharepoint(chemin: str, montages=None) -> str | None:
-    """Adresse SharePoint d'un fichier situé dans un dossier synchronisé, sinon None."""
+    """Adresse SharePoint d'un fichier situé dans un dossier synchronisé, sinon None.
+    Une adresse https:// (source SharePoint par lien) est déjà l'adresse : renvoyée telle quelle."""
+    if str(chemin).lower().startswith(("https://", "http://")):
+        return str(chemin)
     montages = montages_onedrive() if montages is None else montages
     absolu = os.path.abspath(chemin)
     p = os.path.normcase(absolu)

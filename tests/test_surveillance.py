@@ -173,3 +173,33 @@ def test_ranger_ids_excel_bloque_met_la_commune_en_attente(tmp_path, blocage):
                         maj_excel=s.maj_lignes)
     assert set(st["echecs"]) == set(IDS) and "ne répond plus" in st["echecs"][IDS[0]]
     assert src_dir.exists()
+
+
+# ── Connexion Microsoft 365 demandée par Excel (comme audit_validation_finale) ──
+@pytest.mark.skipif(not excel_disponible(), reason="Excel absent")
+def test_fenetre_de_connexion_detectee_puis_connexion_et_reprise(tmp_path, monkeypatch):
+    """Excel invisible bloqué sur la connexion Microsoft 365 : détecté tout de suite (pas au bout du
+    délai anti-blocage), Excel visible proposé pour se connecter, puis le fichier est écrit."""
+    import time
+    from dispatch_sna.services import excel_com
+    src, dst = tmp_path / "src.xlsx", tmp_path / "dst.xlsx"
+    for chemin, rem in ((src, "NOUV"), (dst, "vieux")):
+        wb = Workbook(); ws = wb.active; ws.title = "Audit"; ws.append(ENT); ws.append(["74143_1", rem, None])
+        wb.save(chemin)
+    vraie_maj, etat = SessionExcel.maj_lignes, {"n": 0, "connexions": []}
+
+    def maj_lente(self, *a, **k):
+        etat["n"] += 1
+        if etat["n"] == 1:
+            time.sleep(3)                    # le temps que la fenêtre de connexion soit « vue »
+        return vraie_maj(self, *a, **k)
+    monkeypatch.setattr(SessionExcel, "maj_lignes", maj_lente)
+    monkeypatch.setattr(excel_com, "fenetre_connexion", lambda pid: etat["n"] == 1)
+    monkeypatch.setattr(excel_com, "url_sharepoint", lambda chemin: str(chemin))
+    monkeypatch.setattr(excel_com, "connexion_microsoft365", lambda adresse, delai: etat["connexions"].append(adresse))
+    debut = time.time()
+    with SessionExcelSurveillee(delai_blocage_s=60) as xl:
+        r = xl.maj_lignes(str(src), str(dst), ["74143_1"], ["Remarque"])
+    assert etat["connexions"] == [str(dst)] and r["maj"] == ["74143_1"]
+    assert time.time() - debut < 50                       # bien avant le délai anti-blocage
+    assert load_workbook(dst).active["B2"].value == "NOUV"

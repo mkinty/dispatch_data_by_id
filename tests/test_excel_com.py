@@ -48,18 +48,41 @@ def test_ecriture_via_excel_et_verification(tmp_path):
     assert "DGFIP" in wb.sheetnames
 
 
-def test_fichier_ouvert_ailleurs_est_signale_sans_rien_ecrire(tmp_path):
+def test_fichier_ouvert_par_un_collegue_est_signale_sans_rien_ecrire(tmp_path, monkeypatch):
+    """Collègue sur un autre poste : son classeur n'est pas dans la table des objets de CE poste."""
+    from dispatch_sna.services import excel_com
+    monkeypatch.setattr(excel_com, "_classeur_ouvert_ailleurs", lambda *a, **k: None)
     src, dst = _fichiers(tmp_path)
     avant = open(dst, "rb").read()
-    with SessionExcel() as collegue:                      # un « collègue » garde le classeur ouvert
+    with SessionExcel() as collegue:                      # garde le classeur ouvert en écriture
         wb = collegue.xl.Workbooks.Open(dst)
         try:
             with SessionExcel() as xl:
                 r = xl.maj_lignes(src, dst, ["74143_2"], ["Remarque"])
         finally:
-            wb.Close(False)
+            # Artefact du montage (deux instances pilotées depuis le même fil) : l'objet du
+            # « collègue » peut être déconnecté ici ; en réel il est sur un autre poste.
+            try: wb.Close(False)
+            except Exception: pass
     assert r["bloque"] and r["maj"] == []
     assert open(dst, "rb").read() == avant
+
+
+def test_fichier_ouvert_dans_votre_propre_excel_ecrit_dedans(tmp_path):
+    """Comme audit_validation_finale : le classeur ouvert dans votre Excel est mis à jour, enregistré,
+    et reste ouvert (au lieu d'un faux « verrouillé par vous-même »)."""
+    src, dst = _fichiers(tmp_path)
+    with SessionExcel() as vous:                          # « votre » Excel, autre instance, même session
+        wb = vous.xl.Workbooks.Open(dst)
+        try:
+            with SessionExcel() as xl:
+                r = xl.maj_lignes(src, dst, ["74143_2"], ["Remarque"])
+            assert r["bloque"] is None and r["maj"] == ["74143_2"] and r["non_verifies"] == []
+            assert "votre Excel" in r["ouverture"]
+            assert wb.Worksheets("Audit").Range("C3").Value == "Remarque IA"   # toujours ouvert, à jour
+        finally:
+            wb.Close(False)
+    assert load_workbook(dst)["Audit"]["C3"].value == "Remarque IA"          # bien enregistré
 
 
 def test_excel_occupe_l_appel_attend_au_lieu_d_echouer():

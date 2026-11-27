@@ -6,7 +6,8 @@ PPT_FOLDER   = "analyse"
 PPT_PREFIX   = "cas_analyse_"
 
 ONGLET_AUDIT = "Audit"
-COL_ID_ERR   = "ID erreur"
+COL_ID_IMM   = "ID imm"      # identifiant d'une ligne (unique) : clé des mises à jour
+COL_ID_ERR   = "ID erreur"   # peut couvrir plusieurs lignes ; nomme le PPT cas_analyse_<ID erreur>.pptx
 COL_REMARQUE = "Remarque"
 COL_LIEN_SV  = "Lien Street View"
 

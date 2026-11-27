@@ -19,8 +19,9 @@ from urllib.parse import unquote
 
 from openpyxl.utils import get_column_letter
 
-from .constantes import ONGLET_AUDIT, COL_ID_ERR
-from .excel_rows import ExcelErreur, OngletIntrouvable, affichage_modifie, choisir_onglet, repli_premiere_feuille, lire_cellules, formule_pour, _norm
+from .constantes import ONGLET_AUDIT, COL_ID_ERR, COL_ID_IMM
+from .excel_rows import (CLES, ExcelErreur, OngletIntrouvable, affichage_modifie, choisir_onglet, cle_de,
+                         repli_premiere_feuille, lire_cellules, formule_pour, _norm)
 from .onedrive import url_sharepoint
 
 _EN = 1033                 # propriétés NumberFormat / Formula toujours en anglais (sinon « General » est refusé en français)
@@ -264,6 +265,25 @@ def _conforme(cell, attendu, lien) -> bool:
     return ok
 
 
+def _liberer_objets_com(exc):
+    """Vide, sur le fil courant, les variables locales des cadres de la trace de `exc`.
+
+    Une exception garde dans sa trace les cadres d'exécution, donc leurs variables locales :
+    classeur, feuille, cellules… Ces objets COM seraient sinon libérés plus tard par le
+    ramasse-miettes, depuis n'importe quel fil — par exemple le fil de traitement à qui
+    l'exception est transmise. Libérer un objet COM hors de son appartement peut faire
+    planter Python sans message. Le type et le message de l'exception sont conservés.
+    (Même correctif que dans audit_validation_finale.)
+    """
+    import traceback
+    vues = set()
+    while exc is not None and id(exc) not in vues:
+        vues.add(id(exc))
+        if exc.__traceback__ is not None:
+            traceback.clear_frames(exc.__traceback__)
+        exc = exc.__cause__ or exc.__context__
+
+
 # ── processus Excel ───────────────────────────────────────────────
 def _pid_de(xl):
     """PID de l'instance Excel pilotée (via la fenêtre principale)."""
@@ -321,6 +341,82 @@ def _tuer(pid, attente_s=15) -> bool:
         return False
     finally:
         win32api.CloseHandle(h)
+
+
+# ── Connexion Microsoft 365 demandée par Office (comme audit_validation_finale) ──
+# Classe de fenêtre de la connexion « moderne » d'Office (WebView) : son apparition dans le
+# processus Excel / PowerPoint pendant un appel = connexion au compte professionnel demandée.
+_CLASSES_CONNEXION = {"BasicEmbeddedBrowser"}
+
+
+def fenetre_connexion(pid) -> bool:
+    """Vrai si le processus `pid` affiche la fenêtre de connexion Microsoft 365."""
+    if not pid:
+        return False
+    try:
+        import win32gui, win32process
+    except ImportError:
+        return False
+    trouvee = []
+
+    def examiner(fenetre, _):
+        try:
+            if (win32process.GetWindowThreadProcessId(fenetre)[1] == pid
+                    and win32gui.GetClassName(fenetre) in _CLASSES_CONNEXION):
+                trouvee.append(fenetre)
+                return False
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumWindows(examiner, None)
+    except Exception:          # EnumWindows « échoue » quand le rappel l'arrête
+        pass
+    return bool(trouvee)
+
+
+def connexion_microsoft365(adresse: str, delai_s: float = 300) -> None:
+    """Ouvre `adresse` (fichier SharePoint) dans un Excel VISIBLE pour que l'utilisateur se
+    connecte une fois à son compte professionnel. Office mémorise la connexion : les instances
+    invisibles suivantes ouvrent ensuite les fichiers sans rien demander.
+    Lève ConnexionRequise si la connexion n'est pas faite dans le délai."""
+    import threading
+    etat = {"pid": None}
+    fini = threading.Event()
+
+    def ouvrir():
+        pythoncom = _pythoncom()
+        pythoncom.CoInitialize()
+        xl = None
+        try:
+            import win32com.client as wc
+            xl = wc.DispatchEx("Excel.Application")
+            etat["pid"] = _pid_de(xl)
+            xl.Visible = True
+            try: xl.WindowState = -4137                # xlMaximized, au premier plan
+            except Exception: pass
+            wb = xl.Workbooks.Open(adresse, 0, True)   # lecture seule : seulement pour se connecter
+            wb.Close(False)
+            etat["ok"] = True
+        except BaseException as e:
+            etat["erreur"] = e
+        finally:
+            try: xl.Quit()
+            except Exception: pass
+            xl = None
+            pythoncom.CoUninitialize()
+            fini.set()
+
+    threading.Thread(target=ouvrir, name="excel-connexion", daemon=True).start()
+    fini.wait(delai_s)
+    if not etat.get("ok"):
+        _tuer(etat["pid"])
+        raise ConnexionRequise(f"connexion Microsoft 365 non effectuée en {delai_s / 60:.0f} min"
+                               + (f" ({etat['erreur']})" if etat.get("erreur") else "")
+                               + " — ouvrez une fois un fichier du site SharePoint dans Excel, connectez-vous "
+                                 "avec votre compte professionnel, puis rejouez les ID en attente")
+    _terminer_si_toujours_ouvert(etat["pid"], attente_s=10)
 
 
 # ── session ───────────────────────────────────────────────────────
@@ -415,8 +511,8 @@ class SessionExcel:
         url = url_sharepoint(dst)
         erreur = None
         for cible, mode in ((url, "co-édition SharePoint"), (dst, "fichier local OneDrive")):
-            if not cible:
-                continue
+            if not cible or (cible == url and mode != "co-édition SharePoint"):
+                continue                     # source par lien : pas de copie locale à essayer
             try:
                 # Open(Filename, UpdateLinks, ReadOnly, Format, Password, WriteResPassword,
                 #      IgnoreReadOnlyRecommended, Origin, Delimiter, Editable, Notify, Converter, AddToMru)
@@ -526,6 +622,7 @@ class SessionExcel:
                 res["tentatives"] = essai
                 return res
             except Exception as e:
+                _liberer_objets_com(e)           # classeur, feuille, cellules : libérés ici, sur ce fil
                 # Objet invalidé par une fusion SharePoint (0x800A01A8) : rouvrir le classeur suffit
                 if not (_est_rejet(e) or isinstance(e, ExcelOccupe) or _est_objet_invalide(e)):
                     raise
@@ -540,11 +637,12 @@ class SessionExcel:
                 time.sleep(5 * essai)
 
     def _maj_une_fois(self, lecture, dst, colonnes) -> dict:
-        voulues = None if colonnes is None else {str(c).strip() for c in colonnes} - {COL_ID_ERR}
+        voulues = None if colonnes is None else {str(c).strip() for c in colonnes} - set(CLES)
         res = {"maj": [], "absents_src": lecture["absents_src"], "absents_dst": [],
                "donnees": lecture["donnees"], "ids_src": lecture["ids_src"], "col_absentes": [],
                "bloque": None, "non_verifies": [], "ouverture": None, "affichage": None, "videes": {},
-               "onglets": {"src": lecture["onglet"], "dst": None}, "liens_refuses": {}}
+               "onglets": {"src": lecture["onglet"], "dst": None}, "liens_refuses": {},
+               "id_erreur": lecture.get("id_erreur", {})}
         a_ecrire = {i: c for i, c in lecture["cellules"].items() if c}
         if not a_ecrire:
             if voulues:
@@ -555,6 +653,8 @@ class SessionExcel:
         wb, res["ouverture"] = self._ouvrir(dst)
         self._vivant()
         calcul = None
+        externe = False      # classeur ouvert dans l'Excel de l'UTILISATEUR : jamais fermé ni réglé
+        xl = self.xl
         try:
             # Enregistrement automatique coupé pour NOTRE instance : chaque sauvegarde auto
             # déclenche une fusion SharePoint (et sa fenêtre « Nous rechargeons votre classeur… »).
@@ -566,8 +666,21 @@ class SessionExcel:
             if wb.ReadOnly:
                 try: qui = wb.WriteReservedBy
                 except Exception: qui = ""
-                res["bloque"] = qui or "un autre utilisateur"
-                return res
+                # Ouvert en écriture dans VOTRE propre Excel : notre instance ne l'a qu'en lecture
+                # seule. On écrit alors dans votre classeur ouvert (cellules seulement), qui est
+                # enregistré et reste ouvert. (Même solution que dans audit_validation_finale.)
+                ouvert = _classeur_ouvert_ailleurs([url_sharepoint(dst), dst], self.xl)
+                if ouvert is None:
+                    # Ouvert en mode EXCLUSIF (Excel ancien, enregistrement automatique coupé,
+                    # fichier .xls…) : la co-édition est impossible tant qu'il reste ouvert.
+                    res["bloque"] = (f"{qui or 'un autre utilisateur'} (classeur ouvert en mode exclusif, pas en "
+                                     "co-édition : Excel ne l'obtient qu'en lecture seule — il doit être fermé, ou "
+                                     "ouvert dans Excel Online / Microsoft 365 avec l'enregistrement automatique)")
+                    return res
+                try: wb.Close(False)
+                except Exception: pass
+                wb, externe, xl = ouvert, True, ouvert.Application
+                res["ouverture"] = "classeur déjà ouvert dans votre Excel (il reste ouvert)"
             ws = self._onglet(wb)
             res["onglets"]["dst"] = str(ws.Name)
             res["affichage"] = self._retirer_filtres(ws)
@@ -578,51 +691,47 @@ class SessionExcel:
             der_lig = utile.Row + utile.Rows.Count - 1
             entetes = {str(v).strip(): c for c, v in enumerate(_plat(ws.Range(ws.Cells(1, 1), ws.Cells(1, der_col)).Value), 1)
                        if v is not None and str(v).strip()}
-            if COL_ID_ERR not in entetes:
-                raise ValueError(f"colonne « {COL_ID_ERR} » absente de l'Excel SharePoint")
             if voulues:
                 res["col_absentes"] = sorted(voulues - (set(lecture["entetes"]) & set(entetes)))
-            c_id = entetes[COL_ID_ERR]
-            lignes = {}
-            if der_lig >= 2:
-                for r, v in enumerate(_plat(ws.Range(ws.Cells(2, c_id), ws.Cells(der_lig, c_id)).Value), 2):
-                    k = _norm(v)
-                    if k and k not in lignes:
-                        lignes[k] = r
+            lignes = _index_cles_com(ws, entetes, list(a_ecrire), der_lig)
 
             # Calcul suspendu pendant l'écriture : sinon chaque cellule relance un recalcul
             # complet du classeur et Excel refuse les appels suivants. Rétabli avant Save.
-            calcul = self.xl.Calculation
-            self.xl.Calculation = _XL_CALC_MANUEL
+            # Jamais dans l'Excel de l'utilisateur : ses réglages ne sont pas touchés.
+            if not externe:
+                calcul = xl.Calculation
+                xl.Calculation = _XL_CALC_MANUEL
             ecrits = {}                          # ID → [(cellule, attendu, lien)]
             for i, cells in a_ecrire.items():
-                r = lignes.get(i)
-                if r is None:
+                rangs = lignes.get(i)
+                if not rangs:
                     res["absents_dst"].append(i); continue
                 faits = []
-                for nom, cel in cells.items():
-                    self._vivant()
-                    c = entetes.get(nom)
-                    if c is None:
-                        continue
-                    attendu = formule_pour(cel.valeur, cel.coord, f"{get_column_letter(c)}{r}")
-                    cell = ws.Cells(r, c)
-                    if attendu in (None, "") and cell.Formula != "":
-                        res["videes"].setdefault(i, []).append(nom)
-                    try:
-                        lien_ok = _ecrire(ws, cell, attendu, cel.lien, cel.format)
-                    except Exception as e:
-                        if not _est_rejet(e) and ws.ProtectContents:
-                            raise ExcelErreur(f"onglet « {ONGLET_AUDIT} » protégé et cellule {nom} verrouillée : "
-                                              "ôtez la protection de la feuille puis rejouez") from e
-                        raise
-                    if not lien_ok:
-                        res["liens_refuses"].setdefault(i, []).append(nom)
-                    faits.append((cell, attendu if lien_ok or attendu not in (None, "") else cel.lien,
-                                  cel.lien if lien_ok else None))
+                for r in rangs:                  # toutes les lignes d'un ID imm en doublon
+                    for nom, cel in cells.items():
+                        self._vivant()
+                        c = entetes.get(nom)
+                        if c is None:
+                            continue
+                        attendu = formule_pour(cel.valeur, cel.coord, f"{get_column_letter(c)}{r}")
+                        cell = ws.Cells(r, c)
+                        if attendu in (None, "") and cell.Formula != "" and nom not in res["videes"].get(i, []):
+                            res["videes"].setdefault(i, []).append(nom)
+                        try:
+                            lien_ok = _ecrire(ws, cell, attendu, cel.lien, cel.format)
+                        except Exception as e:
+                            if not _est_rejet(e) and ws.ProtectContents:
+                                raise ExcelErreur(f"onglet « {ONGLET_AUDIT} » protégé et cellule {nom} verrouillée : "
+                                                  "ôtez la protection de la feuille puis rejouez") from e
+                            raise
+                        if not lien_ok and nom not in res["liens_refuses"].get(i, []):
+                            res["liens_refuses"].setdefault(i, []).append(nom)
+                        faits.append((cell, attendu if lien_ok or attendu not in (None, "") else cel.lien,
+                                      cel.lien if lien_ok else None))
                 if faits:
                     ecrits[i] = faits
-            self.xl.Calculation = calcul; calcul = None   # le fichier est enregistré avec son mode de calcul d'origine
+            if calcul is not None:
+                xl.Calculation = calcul; calcul = None   # enregistré avec son mode de calcul d'origine
             if not ecrits and not affichage_modifie(res["affichage"]):
                 return res
             self._attendre_pret()
@@ -643,15 +752,82 @@ class SessionExcel:
             return res
         finally:
             if calcul is not None:
-                try: self.xl.Calculation = calcul
+                try: xl.Calculation = calcul
                 except Exception: pass
-            try: wb.Close(False)
-            except Exception: pass
+            if not externe:
+                try: wb.Close(False)
+                except Exception: pass
+
+
+def _index_cles_com(ws, entetes, ids, der_lig) -> dict[str, list[int]]:
+    """{ID → lignes} dans la feuille Excel : toutes les lignes d'un ID imm, la 1re d'un ID erreur."""
+    besoin = {cle_de(i) for i in ids}
+    for col in CLES:
+        if col in besoin and col not in entetes:
+            raise ValueError(f"colonne « {col} » absente de l'Excel SharePoint")
+    voulus = {_norm(i) for i in ids}
+    res: dict[str, list[int]] = {}
+    if der_lig < 2:
+        return res
+    for col in besoin:
+        c = entetes[col]
+        for r, v in enumerate(_plat(ws.Range(ws.Cells(2, c), ws.Cells(der_lig, c)).Value), 2):
+            k = _norm(v)
+            if k not in voulus or cle_de(k) != col:
+                continue
+            if col == COL_ID_IMM:
+                res.setdefault(k, []).append(r)
+            elif k not in res:
+                res[k] = [r]
+    return res
+
+
+def _cle_classeur(nom) -> str:
+    """Forme comparable d'un chemin ou d'une adresse de classeur."""
+    return unquote(str(nom or "")).replace("\\", "/").strip().rstrip("/").lower()
+
+
+def _classeur_ouvert_ailleurs(cibles, notre_excel=None):
+    """Classeur `cibles` (adresse SharePoint ou chemin) ouvert EN ÉCRITURE dans une autre instance
+    d'Excel de cette session Windows — celle de l'utilisateur —, trouvé dans la table des objets COM
+    en cours (ROT). None sinon. Ne lève jamais. (Repris d'audit_validation_finale.)"""
+    cles = {_cle_classeur(c) for c in cibles if c}
+    if not cles:
+        return None
+    try:
+        pythoncom = _pythoncom()
+        import win32com.client as wc
+        rot = pythoncom.GetRunningObjectTable()
+        contexte = pythoncom.CreateBindCtx(0)
+        try:
+            notre = notre_excel.Hwnd if notre_excel is not None else None
+        except Exception:
+            notre = None
+        for moniker in rot:
+            try:
+                if _cle_classeur(moniker.GetDisplayName(contexte, None)) not in cles:
+                    continue
+                classeur = wc.Dispatch(rot.GetObject(moniker).QueryInterface(pythoncom.IID_IDispatch))
+                if _cle_classeur(classeur.FullName) not in cles or classeur.ReadOnly:
+                    continue
+                if notre is not None and classeur.Application.Hwnd == notre:
+                    continue
+                return classeur
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
 
 
 # ── session surveillée (anti-blocage) ─────────────────────────────
 class ExcelBloque(Exception):
     """Excel n'a plus donné signe de vie : très probablement une fenêtre modale invisible."""
+
+
+class ConnexionRequise(ExcelBloque):
+    """Excel affiche la fenêtre de connexion Microsoft 365 : dans une instance invisible,
+    personne ne peut y répondre. Détectée tout de suite (au lieu d'attendre le délai anti-blocage)."""
 
 
 class SessionExcelSurveillee:
@@ -670,9 +846,14 @@ class SessionExcelSurveillee:
     et ses ID rejoignent « ID en attente » : l'outil ne gèle plus.
     """
 
-    def __init__(self, visible=False, delai_occupe_s=120, delai_blocage_s=120, essais=2):
+    def __init__(self, visible=False, delai_occupe_s=120, delai_blocage_s=120, essais=2,
+                 connexion_interactive=True, delai_connexion_s=300):
         self.visible, self.delai_occupe_s = visible, delai_occupe_s
         self.delai_blocage_s, self.essais = delai_blocage_s, essais
+        # Fenêtre de connexion Microsoft 365 : l'afficher (Excel visible) pour que l'utilisateur
+        # se connecte une fois, puis reprendre — plutôt qu'échouer à chaque fichier.
+        self.connexion_interactive, self.delai_connexion_s = connexion_interactive, delai_connexion_s
+        self._connexion_faite = False
         self._fil = None
         self.relances = 0          # nombre d'instances Excel tuées puis relancées
 
@@ -705,6 +886,9 @@ class SessionExcelSurveillee:
                     try:
                         boite["res"] = getattr(s, fn)(*args)
                     except BaseException as e:
+                        # Ici, sur le fil propriétaire : sinon les objets COM retenus par la trace
+                        # seraient libérés plus tard depuis un autre fil (plantage de Python).
+                        _liberer_objets_com(e)
                         boite["err"] = e
                     boite["fait"].set()
             finally:
@@ -747,6 +931,8 @@ class SessionExcelSurveillee:
         session._vivant()
         self._etat["jobs"].put((fn, args, boite))
         while not boite["fait"].wait(1.0):
+            if fenetre_connexion(session._pid):
+                raise ConnexionRequise("Excel demande une connexion à Microsoft 365 (compte professionnel)")
             if time.time() - session.activite > self.delai_blocage_s:
                 raise ExcelBloque(f"Excel ne répond plus depuis {self.delai_blocage_s} s "
                                   "(fenêtre bloquante invisible, ex. « Nous rechargeons votre classeur… »)")
@@ -757,7 +943,9 @@ class SessionExcelSurveillee:
     def maj_lignes(self, src, dst, ids, colonnes=None) -> dict:
         """SessionExcel.maj_lignes, protégé contre le blocage et la perte de l'instance Excel."""
         derniere = None
-        for essai in range(1, self.essais + 1):
+        essai = 0
+        while essai < self.essais:
+            essai += 1
             if self._fil is None:
                 self._demarrer()
             try:
@@ -765,6 +953,16 @@ class SessionExcelSurveillee:
                 if essai > 1:
                     res["relance_excel"] = essai - 1
                 return res
+            except ConnexionRequise as e:
+                self._relancer()                 # l'instance invisible reste bloquée sur la fenêtre
+                adresse = url_sharepoint(dst)
+                if not self.connexion_interactive or self._connexion_faite or not adresse:
+                    raise ConnexionRequise(f"{e} — ouvrez une fois un fichier du site SharePoint dans Excel, "
+                                           "connectez-vous avec votre compte professionnel, puis rejouez") from None
+                self._connexion_faite = True
+                connexion_microsoft365(adresse, self.delai_connexion_s)
+                essai -= 1                       # la connexion ne compte pas comme un essai
+                continue
             except ExcelBloque as e:
                 derniere = e
             except Exception as e:

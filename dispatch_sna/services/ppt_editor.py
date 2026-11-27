@@ -197,3 +197,44 @@ def modifier_ppt(chemin: str, analyse: str | None, lien: str | None) -> dict:
 def copier_ppt(src: str, dst: str):
     """Remplace dst par src (contenu seul), robuste quand dst est « en ligne uniquement »."""
     copier(src, dst)
+
+
+# ── Zone « Analyse » d'un PPT, pour l'écrire par PowerPoint (co-édition) ──
+_CNVPR = re.compile(r'<p:cNvPr\b[^>]*?\bid="(\d+)"[^>]*?\bname="([^"]*)"')
+_SLD_ID = re.compile(r'<p:sldId\b[^>]*?\bid="(\d+)"[^>]*?\br:id="([^"]+)"')
+
+
+def zone_analyse(chemin: str) -> dict | None:
+    """Où modifier_ppt écrirait « Analyse » : {"slide_id", "shape_id", "nom", "rang"} (rang = rang
+    parmi les formes de même nom de la diapositive), ou None. Même choix de zone que modifier_ppt :
+    PowerPoint, piloté par ppt_com, écrit alors exactement au même endroit."""
+    slide_re = re.compile(r"^ppt/slides/slide\d+\.xml$")
+    with zipfile.ZipFile(io.BytesIO(lire_octets(chemin))) as z:
+        noms = z.namelist()
+        ids = {}
+        if "ppt/presentation.xml" in noms and "ppt/_rels/presentation.xml.rels" in noms:
+            rels = z.read("ppt/_rels/presentation.xml.rels").decode("utf-8")
+            cibles = dict(re.findall(r'<Relationship\b[^>]*?\bId="([^"]+)"[^>]*?\bTarget="([^"]+)"', rels))
+            for sid, rid in _SLD_ID.findall(z.read("ppt/presentation.xml").decode("utf-8")):
+                if rid in cibles:
+                    ids["ppt/" + cibles[rid].lstrip("/").removeprefix("ppt/")] = int(sid)
+        for nom in sorted(n for n in noms if slide_re.match(n)):
+            xml = z.read(nom).decode("utf-8")
+            avant = {}
+            for i, s in enumerate(_SHAPE.finditer(xml)):
+                avant[i] = s.group(0)
+            # Même sélection que _modifier_slide, sans écrire : on marque la zone par un texte témoin
+            temoin = "⁣ZONE⁣"
+            xml2, _r, a_ok, _l = _modifier_slide(xml, "", temoin, None)
+            if not a_ok:
+                continue
+            for i, s in enumerate(_SHAPE.finditer(xml2)):
+                if temoin in s.group(0):
+                    m = _CNVPR.search(avant[i])
+                    if not m:
+                        return None
+                    nom_forme = unescape(m.group(2))
+                    rang = sum(1 for j in range(i) if (_CNVPR.search(avant[j]) or [None, None, None])[2] == m.group(2))
+                    return {"slide_id": ids.get(nom), "fichier": nom, "shape_id": int(m.group(1)),
+                            "nom": nom_forme, "rang": rang}
+    return None

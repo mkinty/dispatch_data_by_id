@@ -8,8 +8,23 @@ rempli + `cas_analyse_<ID>.pptx`) dans l'arborescence SharePoint
 
 - **Commune complète** : l'Excel `audit_<commune>.xlsx` remplace celui de
   SharePoint, tous les PPT sont copiés dans `analyse/`.
-- **ID erreur** : on colle des ID erreur (`74143_1, 74143_2, 38068_207`, comme
-  dans export_lot_by_id). Pour chaque commune :
+- **ID imm** : on colle des **ID imm** (`ID-3806800000IW`, un par ligne), comme
+  dans audit_validation_finale. La commune est donnée par les **5 caractères après
+  « ID- »** (`38068`, ou `2B030` pour `ID-2B030000006D`). Minuscules acceptées,
+  en-tête « ID imm » collé avec les valeurs ignoré, doublons retirés.
+  - **Pourquoi l'ID imm** : un **ID erreur** peut couvrir plusieurs logements, donc
+    plusieurs lignes. Seul l'**ID imm** est unique par ligne. La mise à jour vise
+    donc exactement la ligne saisie, jamais un autre logement du même ID erreur. Un
+    ID imm en double (erreur de saisie) : toutes ses lignes sont mises à jour.
+  - **PPT** : ils restent nommés par ID erreur (`cas_analyse_<ID erreur>.pptx`).
+    L'ID erreur de chaque ID imm est lu dans l'Excel Prod IA, à défaut dans l'Excel
+    SharePoint, ce qui suffit pour les PPT seuls. Plusieurs ID imm du même ID erreur
+    partagent son PPT, traité une seule fois.
+  - **ID erreur collés par erreur** : ils sont reconnus et signalés, sans être
+    utilisés. Les entrées « ID en attente » de l'ancienne version, au format ID
+    erreur, ne sont pas rechargées : il faut recoller leurs ID imm.
+
+  Pour chaque commune :
   - **Excel** : seules les lignes de ces ID sont mises à jour dans
     `DepXX/<commune>/audit_<commune>.xlsx`, et seulement pour les **colonnes
     cochées** dans *Configuration → Colonnes Excel à mettre à jour* (colonnes
@@ -24,7 +39,8 @@ rempli + `cas_analyse_<ID>.pptx`) dans l'arborescence SharePoint
     - Une colonne cochée remplace toujours l'ancienne valeur, **même si la valeur
       de Prod IA est vide** : la cellule SharePoint est alors effacée, lien et
       formule compris, et le journal le signale (🧽).
-    - `ID erreur` n'est pas proposée : elle sert à retrouver les lignes.
+    - `ID imm` et `ID erreur` ne sont pas proposées : la première sert à retrouver
+      les lignes, la seconde à nommer les PPT.
     - Détection : Prod IA jusqu'à 3 niveaux de sous-dossiers (`À déposer/LOTxx/<commune>/`
       compris), puis `DepXX/<commune>/audit_*.xlsx`. Jusqu'à 12 fichiers sont essayés,
       ceux déjà présents sur le disque d'abord. Un fichier n'est retenu que si son onglet
@@ -50,6 +66,41 @@ rempli + `cas_analyse_<ID>.pptx`) dans l'arborescence SharePoint
     - aucune case : Excel seul.
   - Le dossier Prod IA de la commune n'est supprimé que si tout a réussi **et**
     qu'il ne contient pas d'autres ID que ceux saisis.
+
+### Fichier ouvert : jamais écrasé (comme audit_validation_finale)
+
+La voie d'écriture est choisie **fichier par fichier** (`services/ecriture.py`).
+L'outil ne remplace jamais un fichier entier quand quelqu'un l'a ouvert :
+
+| Situation | Ce que fait l'outil |
+|---|---|
+| `🔐 Écrire via Excel` coché, ou fichier **synchronisé avec SharePoint** (dossier OneDrive) | Excel rejoint la **co-édition**, n'écrit que les cellules des ID imm, enregistre puis relit. |
+| Fichier déjà ouvert **dans votre propre Excel** | Les cellules sont écrites **dans ce classeur ouvert**, qui est enregistré et reste ouvert (vos modifications en cours sont enregistrées avec). Avant : « verrouillé par vous-même ». |
+| Fichier local **ouvert**, case décochée | Le fichier verrou `~$…` donne le nom de la personne ; Excel est démarré **à la demande** pour écrire en co-édition. |
+| Fichier ouvert et Excel indisponible | **Rien n'est écrit** : les ID partent en attente, avec le nom de la personne et la raison. |
+| Fichier local libre, case décochée | Réécriture directe (openpyxl). |
+| PPT ouvert (verrou `~$` de PowerPoint) | PPT non écrasé ; ID en attente avec le nom de la personne. |
+| Mode commune, Excel ou PPT ouvert | Fichier non remplacé, dossier Prod IA conservé. |
+
+Deux cas ne peuvent pas être forcés : un classeur ouvert en **mode exclusif**
+(ancien Excel, enregistrement automatique désactivé) et un fichier **extrait**
+(check-out). C'est à la personne qui a le fichier de les débloquer.
+
+### Plantages et interface figée
+
+- **Tkinter jamais appelé depuis le fil de traitement** : la case « Supprimer le
+  dossier » est lue avant le lancement, et plus pendant le lot. Lire une case
+  Tkinter depuis un autre fil peut faire planter l'outil.
+- **Objets Excel libérés sur leur propre fil** : la trace d'une erreur Excel est
+  vidée sur le fil Excel avant d'être transmise (`_liberer_objets_com`, repris
+  d'audit_validation_finale). Sinon, ses objets COM seraient libérés depuis un
+  autre fil, ce qui peut faire planter Python.
+- **Rien n'attend OneDrive dans le fil de l'interface** : l'aperçu (liste de Prod
+  IA, dossier SharePoint de chaque commune) et le bilan préalable au lancement se
+  font en arrière-plan. Mesuré avec 475 communes collées : 42 ms de gel au plus.
+- **Journal** : au plus 300 lignes affichées par rafraîchissement, 6 000 lignes
+  gardées à l'écran. Le **journal complet** du lot est écrit dans
+  `rapports/journal_<date>.txt`, dont le chemin est donné en fin de traitement.
 
 ### Modifications persistantes quand le fichier est ouvert par un collègue
 
@@ -170,6 +221,53 @@ Décocher la case revient à l'ancienne réécriture du fichier (openpyxl).
 `"excel_visible": true` dans `config_dispatcher.json` affiche Excel pendant le
 traitement (diagnostic).
 
+## Sources SharePoint par lien (connexion avec votre compte)
+
+Les deux champs **Racine SharePoint** et **Dossier À déposer** acceptent, au choix :
+
+- un **dossier local** synchronisé par OneDrive (fonctionnement habituel) ;
+- le **lien SharePoint du dossier**, comme dans audit_validation_finale :
+  - l'adresse copiée dans la barre du navigateur, sur le dossier ouvert (`https://…sharepoint.com/sites/…/Audit`, ou `…/Forms/AllItems.aspx?id=…`) ;
+  - un lien de partage « au chemin lisible » (`…/:f:/r/sites/…`) ;
+  - un chemin WebDAV (`\\…sharepoint.com@SSL\DavWWWRoot\…`).
+
+  Un lien de partage opaque (`/:f:/s/…/EaBc…`) ne contient pas le chemin : il est refusé, et l'outil indique la marche à suivre.
+
+On peut mélanger : une source en lien et l'autre en dossier local.
+
+**Connexion** (même processus qu'audit_validation_finale) :
+
+1. Collez le lien, puis quittez le champ ou appuyez sur Entrée.
+2. Cliquez sur **🔗 Se connecter à SharePoint**. L'outil essaie d'abord sans fenêtre, au cas où la session du profil dédié serait encore valide. Sinon, une fenêtre **Edge** (ou Chrome) s'ouvre sur le dossier : identifiez-vous normalement, avec votre compte professionnel et la MFA. La fenêtre se ferme dès que la session ouvre le dossier.
+3. Au démarrage suivant, la reconnexion est silencieuse si la session est encore valide.
+
+L'outil n'enregistre ni mot de passe ni cookie. La session reste dans un profil de navigateur dédié (`%LOCALAPPDATA%\DispatcherSNA\navigateur`), chiffré par Windows. **🚪 Oublier la connexion** efface ce profil.
+
+**Traitement d'une commune** (`services/sharepoint/sources.py`). La logique de rangement reste la même. Un dossier de travail temporaire reçoit uniquement ce qui sert :
+
+| Étape | Source par lien |
+|---|---|
+| Dossier commune de « À déposer » | téléchargé ; une fois rangé avec succès, **mis à la corbeille du site** (restaurable), jamais supprimé définitivement. Le dossier « À déposer » lui-même n'est jamais supprimé. |
+| Excel audit (mise à jour par ID imm) | téléchargé avec sa version (ETag), lignes écrites, puis renvoyé **seulement si personne ne l'a enregistré entre-temps** (If-Match). Sinon il est relu et la mise à jour est refaite (3 essais), donc le travail du collègue n'est jamais perdu. |
+| Excel ouvert par quelqu'un sur SharePoint (Excel, Excel Online, Teams) | SharePoint refuse de remplacer le fichier (verrou 423). L'outil l'ouvre alors dans Excel par son adresse SharePoint, rejoint la co-édition, écrit **cellule par cellule** les colonnes cochées des lignes des ID imm, enregistre et relit les valeurs. SharePoint fusionne avec le travail du collègue. Sans Excel, rien n'est écrit et l'ID passe en attente, avec le nom de la personne. |
+| Classeur ouvert en mode **exclusif** (sans co-édition) | Excel ne l'obtient qu'en lecture seule : rien n'est écrit, le nom de la personne est donné, avec la marche à suivre (le fermer, ou l'ouvrir dans Excel Online / Microsoft 365 avec l'enregistrement automatique). |
+| Excel extrait (check-out) | rien n'est écrit, et le nom de la personne qui l'a extrait est donné. |
+| PPT à modifier | téléchargés avec leur ETag, modifiés, renvoyés (If-Match). |
+| PPT remplacés, fichiers neufs | déposés ; le dossier `analyse` est créé au besoin. |
+| PPT **ouvert** par quelqu'un (sur SharePoint, ou fichier verrou `~$` en local) | écrit **en co-édition PowerPoint**, par son adresse (`services/ppt_com.py`). « Modifier » : seules la zone Analyse (la même que celle choisie par l'édition XML) et la ligne « Lien Street View : » (texte et hyperlien). « Remplacer » : les diapositives du nouveau PPT sont insérées et les anciennes retirées, dans la présentation ouverte. Le résultat est relu après l'enregistrement. Si vous avez déjà ouvert la présentation dans votre PowerPoint, l'outil écrit dans celle-ci, qui reste ouverte. Le PowerPoint de l'utilisateur n'est jamais fermé. |
+| « 🔐 Écrire via Excel » coché | l'Excel est écrit en co-édition, ouvert par son adresse SharePoint. Si Excel ne peut pas ouvrir ce fichier, l'outil passe par l'API. |
+| Envoi par l'API | la version du serveur est **relue** après l'envoi : un ID n'est compté qu'une fois ses valeurs retrouvées sur SharePoint. |
+
+**Connexion Microsoft 365 demandée par Excel** (première ouverture d'un fichier du site) : l'outil la détecte tout de suite, au lieu d'attendre le délai anti-blocage. Il ouvre alors une fenêtre Excel visible pour vous connecter une fois avec votre compte professionnel, puis reprend.
+
+**Fichiers ouverts : nouvel essai.** En fin de lot, les ID refusés parce que leur fichier était ouvert (hors fichier extrait) sont retentés une fois, après 60 s. Les réglages sont `reprises_verrou` et `delai_reprise_s` dans `config_dispatcher.json`.
+
+**Limite.** Avec une racine en **dossier local OneDrive**, un PPT ouvert par un collègue *sur SharePoint* est invisible depuis le poste : seul le fichier verrou `~$` local se voit. Pour être protégé dans tous les cas, utilisez le **lien SharePoint** de la racine.
+
+Si la session expire en cours de lot, celui-ci s'arrête proprement : les communes restantes passent dans « ID en attente ». Il suffit de se reconnecter puis de cliquer sur « Charger les ID en attente ».
+
+Si l'organisation interdit le téléchargement depuis un poste non géré (accès conditionnel), l'outil le signale sans le contourner.
+
 ## Structure
 
 ```
@@ -178,13 +276,20 @@ dispatch_sna/
 ├── config.py                # Chargement/sauvegarde config_dispatcher.json
 ├── services/                # Logique métier PURE — aucune dépendance à Tkinter
 │   ├── constantes.py        #   préfixes Dep/audit_/cas_analyse_, noms de colonnes
-│   ├── error_ids.py         #   extraction des ID erreur, regroupés par commune
+│   ├── error_ids.py         #   extraction des ID imm (et ID erreur), regroupés par commune
+│   ├── ecriture.py          #   voie d'écriture par fichier : co-édition si ouvert ou synchronisé
 │   ├── excel_rows.py        #   en-têtes, lecture et remplacement des lignes (openpyxl)
 │   ├── excel_com.py         #   écriture cellule par cellule via Excel, en co-édition + vérification
 │   ├── onedrive.py          #   dossier synchronisé local → adresse SharePoint
 │   ├── attente.py           #   liste persistante des ID non appliqués
 │   ├── ppt_editor.py        #   réécriture Analyse / Lien Street View (XML du .pptx)
+│   ├── ppt_com.py           #   PPT ouvert : écriture via PowerPoint, en co-édition + relecture
 │   ├── chemins.py           #   arborescence Prod IA / SharePoint, copies, détection des colonnes
+│   ├── sharepoint/          #   sources par LIEN (repris d'audit_validation_finale)
+│   │   ├── navigateur.py    #     Edge/Chrome piloté (profil dédié) : identification, cookies
+│   │   ├── connexion.py     #     liens acceptés, connexion silencieuse puis fenêtre, sessions
+│   │   ├── rest.py          #     API SharePoint : lecture, ETag/If-Match, dépôt, corbeille
+│   │   └── sources.py       #     dossier de travail par commune + envoi des fichiers écrits
 │   └── dispatcher.py        #   orchestration : ranger_commune / ranger_ids
 └── gui/                     # Présentation uniquement — délègue aux services
     ├── theme.py             #   couleurs et polices

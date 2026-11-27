@@ -64,7 +64,7 @@ def test_detection_explique_pourquoi_chaque_fichier_est_ecarte(tmp_path):
     assert "3 fichier(s) Excel trouvé(s)" in texte
     assert ("a_sans_audit.xlsx : onglet « Audit » introuvable (onglets présents : DGFIP) ; "
             "la 1re feuille « DGFIP » n'a pas non plus de colonne « ID erreur »") in texte
-    assert "b_sans_id.xlsx : pas de colonne « ID erreur »" in texte
+    assert "b_sans_id.xlsx : pas de colonne « ID imm » ni « ID erreur »" in texte
     assert "c_abime.xlsx : n'est pas un .xlsx lisible" in texte
     assert "SharePoint : dossier introuvable" in texte
 
